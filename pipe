@@ -304,8 +304,9 @@ class Pipe:
         SYNTHESIS_TEMPERATURE: float = Field(
             default=0.6, description="Temperature for final synthesis", ge=0.0, le=2.0
         )
-        OLLAMA_URL: str = Field(
-            default="http://localhost:11434", description="URL for Ollama API"
+        EMBEDDING_API_BASE: str = Field(
+            default="http://localhost:11434",
+            description="Base URL for OpenAI-compatible embedding API (no trailing slash)",
         )
         SEARCH_URL: str = Field(
             default="http://192.168.1.1:8888/search?q=",
@@ -422,11 +423,15 @@ class Pipe:
             default=True,
             description="Enable verification of citations against sources",
         )
+        OUTPUT_LANGUAGE: str = Field(
+            default="auto",
+            description="Language for model-generated text (e.g. 'auto', 'en', 'pl')",
+        )
         THREAD_WORKERS: int = Field(
-            default=2,
+            default=50,
             description="Number of worker threads for parallel processing",
             ge=1,
-            le=2,
+            le=50,
         )
 
     def __init__(self):
@@ -445,6 +450,7 @@ class Pipe:
         self.is_pdf_content = False
         self.research_date = None
         self.trajectory_accumulator = None
+        self.embedding_dim: Optional[int] = None
 
         self.research_date = datetime.now().strftime("%Y-%m-%d")
         self.executor = concurrent.futures.ThreadPoolExecutor(
@@ -603,42 +609,26 @@ class Pipe:
             logger.info(f"Full state reset for conversation: {self.conversation_id}")
 
     def pipes(self) -> list[dict[str, str]]:
-        return [{"id": f"{name}-pipe", "name": f"{name} Pipe"}]
+        return [{"id": f"{name}", "name": f"{name}"}]
 
     async def count_tokens(self, text: str) -> int:
-        """Count tokens in text using Ollama API"""
+        """Approximate token count for text.
+
+        Uses a lightweight heuristic based on whitespace-separated words to
+        avoid relying on any specific tokenizer API.
+        """
         if not text:
             return 0
 
-        try:
-            # Use Ollama's tokenize endpoint with the specified model
-            connector = aiohttp.TCPConnector(force_close=True)
-            async with aiohttp.ClientSession(connector=connector) as session:
-                payload = {
-                    "model": self.valves.RESEARCH_MODEL,
-                    "prompt": text,  # Do not limit length for token counting
-                }
-
-                async with session.post(
-                    f"{self.valves.OLLAMA_URL}/api/tokenize", json=payload, timeout=10
-                ) as response:
-                    if response.status == 200:
-                        result = await response.json()
-                        tokens = result.get("tokens", [])
-                        # If we got only a partial count due to truncation, estimate full count
-                        if len(text) > 2000:
-                            ratio = len(text) / 2000
-                            return int(len(tokens) * ratio)
-                        return len(tokens)
-        except Exception as e:
-            logger.error(f"Error counting tokens with Ollama API: {e}")
-
-        # Fallback to simple estimation if API call fails
         words = text.split()
         return int(len(words) * 1.3)  # Approximate token count using words
 
     async def get_embedding(self, text: str) -> Optional[List[float]]:
-        """Get embedding for a text string using the configured embedding model with caching"""
+        """Get embedding for a text string using the configured embedding model with caching.
+
+        The embedding model is expected to be served behind an OpenAI-compatible
+        `/v1/embeddings` endpoint.
+        """
         if not text or not text.strip():
             return None
 
@@ -660,24 +650,40 @@ class Pipe:
                 }
 
                 async with session.post(
-                    f"{self.valves.OLLAMA_URL}/api/embed", json=payload, timeout=30
+                    f"{self.valves.EMBEDDING_API_BASE}/v1/embeddings",
+                    json=payload,
+                    timeout=30,
                 ) as response:
                     if response.status == 200:
                         result = await response.json()
-                        # Handle both old and new API response formats
-                        if "embedding" in result:
-                            embedding = result.get("embedding", [])
-                            if embedding:
-                                # Cache the result
-                                self.embedding_cache.set(text, embedding)
-                                return embedding
-                        elif "embeddings" in result and result["embeddings"]:
-                            # New format with batch response (we only sent one text, so take first)
-                            embedding = result["embeddings"][0]
-                            if embedding:
-                                # Cache the result
-                                self.embedding_cache.set(text, embedding)
-                                return embedding
+                        embedding: Optional[List[float]] = None
+
+                        # OpenAI-style response: {"data": [{"embedding": [...]}], ...}
+                        if isinstance(result, dict) and "data" in result:
+                            data = result.get("data") or []
+                            if isinstance(data, list) and data:
+                                first_item = data[0] or {}
+                                embedding = first_item.get("embedding")
+
+                        # Fallback: some backends might return {"embedding": [...]} directly
+                        if embedding is None and "embedding" in result:
+                            embedding = result.get("embedding")
+
+                        if embedding:
+                            # Cache the result
+                            self.embedding_cache.set(text, embedding)
+
+                            # Store embedding dimension the first time we see it
+                            if self.embedding_dim is None:
+                                try:
+                                    self.embedding_dim = len(embedding)
+                                    logger.info(
+                                        f"Detected embedding dimension: {self.embedding_dim}"
+                                    )
+                                except Exception:
+                                    pass
+
+                            return embedding
                     else:
                         logger.warning(
                             f"Embedding request failed with status {response.status}"
@@ -864,7 +870,12 @@ class Pipe:
             return await self.load_vocabulary_embeddings()
 
     async def load_vocabulary_embeddings(self):
-        """Get embeddings for vocabulary words using existing batch processing or pre-built embeddings"""
+        """Get embeddings for vocabulary words using the current embedding model.
+
+        This implementation always computes embeddings on the fly using
+        `get_embedding` instead of loading a pre-built file, so it stays
+        compatible with whatever embedding model is configured.
+        """
         # If we already have the embeddings, return them
         if self.vocabulary_embeddings is not None:
             return self.vocabulary_embeddings
@@ -878,11 +889,6 @@ class Pipe:
                 f"Loaded {len(self.vocabulary_embeddings)} vocabulary embeddings from state"
             )
             return self.vocabulary_embeddings
-
-        # Try to load pre-built embeddings first
-        prebuilt_embeddings = await self.load_prebuilt_vocabulary_embeddings()
-        if prebuilt_embeddings:
-            return prebuilt_embeddings
 
         # If pre-built embeddings failed, load vocabulary and generate embeddings
         vocab = await self.load_vocabulary()
@@ -2449,7 +2455,8 @@ class Pipe:
 
             # If we couldn't get a sample, use default dimension
             if not sample_embedding:
-                self.trajectory_accumulator = TrajectoryAccumulator(384)
+                fallback_dim = self.embedding_dim or 384
+                self.trajectory_accumulator = TrajectoryAccumulator(fallback_dim)
 
         try:
             # Limit to last 5 cycles worth of data for efficiency
@@ -2909,7 +2916,13 @@ class Pipe:
             return None
 
     async def translate_dimensions_to_words(self, dimensions, coverage):
-        """Translate research dimensions to human-readable concepts using vocabulary embeddings with caching"""
+        """Translate research dimensions to human-readable concepts using the LLM.
+
+        For each dimension we:
+        - find the topics with the strongest projection on that dimension,
+        - pick one representative and a few nearest neighbours,
+        - ask the LLM to name the common theme in 2–4 words.
+        """
         if not dimensions or not coverage:
             return []
 
@@ -2924,65 +2937,146 @@ class Pipe:
 
         # Check if we have a cached translation
         if cache_key in dimensions_cache:
-            logger.info(f"Using cached dimension translation")
+            logger.info("Using cached dimension translation")
             return dimensions_cache[cache_key]
 
         dimension_labels = []
 
-        # Ensure we have vocabulary embeddings
-        if not self.vocabulary_embeddings:
-            # If not loaded yet, load them now
-            self.vocabulary_embeddings = await self.load_vocabulary_embeddings()
-
-        if not self.vocabulary_embeddings:
-            default_labels = [f"Dimension {i+1}" for i in range(len(coverage))]
-            dimensions_cache[cache_key] = default_labels
-            self.update_state("dimensions_translation_cache", dimensions_cache)
-            return default_labels
-
-        # Get eigenvectors which represent the dimensions
         eigenvectors = np.array(dimensions.get("eigenvectors", []))
+        topic_texts = dimensions.get("topic_texts", [])
+        topic_embeddings = dimensions.get("topic_embeddings", [])
 
-        if len(eigenvectors) == 0 or len(eigenvectors) != len(coverage):
-            default_labels = [f"Dimension {i+1}" for i in range(len(coverage))]
+        if (
+            len(eigenvectors) == 0
+            or len(eigenvectors) != len(coverage)
+            or not topic_texts
+            or not topic_embeddings
+        ):
+            default_labels = [
+                {
+                    "dimension": i + 1,
+                    "words": f"Dimension {i+1}",
+                    "coverage": coverage[i],
+                }
+                for i in range(len(coverage))
+            ]
             dimensions_cache[cache_key] = default_labels
             self.update_state("dimensions_translation_cache", dimensions_cache)
             return default_labels
 
         try:
-            # Process each dimension
-            for i, eigen_vector in enumerate(eigenvectors):
-                # Find vocabulary words that align with this dimension
-                word_alignments = []
-                for word, embedding in self.vocabulary_embeddings.items():
-                    # Calculate alignment (dot product) with dimension vector
-                    alignment = np.dot(eigen_vector, embedding)
-                    word_alignments.append((word, alignment))
+            embeddings_array = np.array(topic_embeddings)
 
-                # Get top positive aligned words
-                top_words = sorted(word_alignments, key=lambda x: x[1], reverse=True)[
-                    :3
+            # Ensure shape compatibility
+            if embeddings_array.shape[1] != eigenvectors.shape[1]:
+                logger.warning(
+                    "Embedding dimension mismatch in translate_dimensions_to_words, "
+                    "falling back to default labels"
+                )
+                default_labels = [
+                    {
+                        "dimension": i + 1,
+                        "words": f"Dimension {i+1}",
+                        "coverage": coverage[i],
+                    }
+                    for i in range(len(coverage))
                 ]
-                top_words_str = ", ".join([word for word, _ in top_words])
+                dimensions_cache[cache_key] = default_labels
+                self.update_state("dimensions_translation_cache", dimensions_cache)
+                return default_labels
 
-                # Create label
+            # Use synthesis model (the one used for summaries) for naming
+            synthesis_model = self.get_synthesis_model()
+            # Keep internal dimension naming prompts in English regardless of UI language
+            label_lang = "en"
+
+            for i, eigen_vector in enumerate(eigenvectors):
+                # Project topics onto this dimension
+                projection_scores = embeddings_array.dot(eigen_vector)
+
+                # Sort topics by absolute projection strength (most representative first)
+                indices = np.argsort(-np.abs(projection_scores))
+
+                top_indices = indices[:5] if len(indices) >= 5 else indices
+                if len(top_indices) == 0:
+                    label_text = f"Dimension {i+1}"
+                else:
+                    representative = topic_texts[top_indices[0]]
+                    neighbours = [
+                        topic_texts[idx] for idx in top_indices[1:] if idx < len(topic_texts)
+                    ]
+
+                    topics_block_lines = [f"- {representative}"]
+                    for n in neighbours:
+                        topics_block_lines.append(f"- {n}")
+                    topics_block = "\n".join(topics_block_lines)
+
+                    system_prompt = (
+                        "You are helping to name semantic clusters of research topics.\n"
+                        "Given a small list of closely related topics, identify the single common theme "
+                        "and express it as a short label of 2–4 words in English.\n"
+                        "Return only the label text, without quotation marks, numbering, or extra commentary."
+                    )
+                    user_prompt = (
+                        "Here is a cluster of related research topics:\n"
+                        f"{topics_block}\n\n"
+                        "Name the shared theme in 2–4 words in English."
+                    )
+
+                    messages = [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt},
+                    ]
+
+                    try:
+                        response = await self.generate_completion(
+                            synthesis_model,
+                            messages,
+                            temperature=self.valves.SYNTHESIS_TEMPERATURE,
+                        )
+                        raw_label = (
+                            response["choices"][0]["message"]["content"]
+                            if response
+                            else ""
+                        )
+                        # Take first line, strip bullets/quotes
+                        label_line = raw_label.split("\n")[0].strip()
+                        label_line = label_line.lstrip("-•*").strip()
+                        if (
+                            len(label_line) >= 2
+                            and label_line[0] in ("'", '"')
+                            and label_line[-1] == label_line[0]
+                        ):
+                            label_line = label_line[1:-1].strip()
+
+                        label_text = label_line or f"Dimension {i+1}"
+                    except Exception as e:
+                        logger.error(f"Error generating LLM label for dimension {i+1}: {e}")
+                        label_text = f"Dimension {i+1}"
+
                 cov_percentage = coverage[i]
                 dimension_labels.append(
                     {
                         "dimension": i + 1,
-                        "words": top_words_str,
+                        "words": label_text,
                         "coverage": cov_percentage,
                     }
                 )
 
-            # Cache the translation
             dimensions_cache[cache_key] = dimension_labels
             self.update_state("dimensions_translation_cache", dimensions_cache)
 
             return dimension_labels
         except Exception as e:
-            logger.error(f"Error translating dimensions to words: {e}")
-            default_labels = [f"Dimension {i+1}" for i in range(len(coverage))]
+            logger.error(f"Error translating dimensions to words with LLM: {e}")
+            default_labels = [
+                {
+                    "dimension": i + 1,
+                    "words": f"Dimension {i+1}",
+                    "coverage": coverage[i],
+                }
+                for i in range(len(coverage))
+            ]
             dimensions_cache[cache_key] = default_labels
             self.update_state("dimensions_translation_cache", dimensions_cache)
             return default_labels
@@ -3025,29 +3119,37 @@ class Pipe:
     async def initialize_research_dimensions(
         self, outline_items: List[str], user_query: str
     ):
-        """Initialize the semantic dimensions for tracking research progress"""
+        """Initialize the semantic dimensions for tracking research progress.
+
+        In addition to the PCA decomposition itself, this stores the
+        outline texts and their embeddings so we can later derive
+        human-readable names for each dimension using the LLM.
+        """
         try:
+            topic_texts: List[str] = []
+            topic_embeddings: List[List[float]] = []
+
             # Get embeddings for each outline item sequentially
-            item_embeddings = []
             for item in outline_items:
                 embedding = await self.get_embedding(item[:2000])
                 if embedding:
-                    item_embeddings.append(embedding)
+                    topic_texts.append(item)
+                    topic_embeddings.append(embedding)
 
             # Ensure we have enough embeddings for PCA
-            if len(item_embeddings) < 3:
+            if len(topic_embeddings) < 3:
                 logger.warning(
-                    f"Not enough valid embeddings for research dimensions: {len(item_embeddings)}/3 required"
+                    f"Not enough valid embeddings for research dimensions: {len(topic_embeddings)}/3 required"
                 )
                 self.update_state("research_dimensions", None)
                 return
 
             # Apply PCA to reduce to key dimensions
-            pca = PCA(n_components=min(10, len(item_embeddings)))
-            embedding_array = np.array(item_embeddings)
+            pca = PCA(n_components=min(10, len(topic_embeddings)))
+            embedding_array = np.array(topic_embeddings)
             pca.fit(embedding_array)
 
-            # Store the PCA model and progress trackers
+            # Store the PCA model, topic metadata, and progress trackers
             research_dimensions = {
                 "eigenvectors": pca.components_.tolist(),
                 "eigenvalues": pca.explained_variance_.tolist(),
@@ -3057,6 +3159,9 @@ class Pipe:
                 "coverage": np.zeros(
                     pca.n_components_
                 ).tolist(),  # Initialize empty coverage
+                # For LLM-based naming of dimensions
+                "topic_texts": topic_texts,
+                "topic_embeddings": topic_embeddings,
             }
 
             self.update_state("research_dimensions", research_dimensions)
@@ -5427,7 +5532,20 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
                     if repeat_count > 1:
                         result_text += f"*Note: This URL has been processed {repeat_count} times*\n\n"
 
-                    await self.emit_message(result_text)
+                    # Wrap verbose result in a collapsible block to reduce clutter in the UI
+                    summary_label = (
+                        (url if processed_result.get("url") else document_title)
+                        or "Result"
+                    )
+                    if len(summary_label) > 120:
+                        summary_label = summary_label[:117] + "..."
+
+                    collapsible_result = (
+                        f"<details>\n<summary>{summary_label}</summary>\n\n"
+                        f"{result_text}</details>"
+                    )
+
+                    await self.emit_message(collapsible_result)
 
                     # Reset failed count on success
                     failed_count = 0
@@ -5484,7 +5602,16 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
                 formatted_content = await self.clean_text_formatting(content_to_display)
                 result_text += f"{formatted_content}...\n\n"
 
-                await self.emit_message(result_text)
+                summary_label = (url or document_title) or "Result"
+                if len(summary_label) > 120:
+                    summary_label = summary_label[:117] + "..."
+
+                collapsible_result = (
+                    f"<details>\n<summary>{summary_label}</summary>\n\n"
+                    f"{result_text}</details>"
+                )
+
+                await self.emit_message(collapsible_result)
 
         # If we still didn't get any successful results, log this
         if not successful_results:
@@ -5516,12 +5643,54 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
         messages: List[Dict],
         stream: bool = False,
         temperature: Optional[float] = None,
+        user_facing: bool = False,
     ):
         """Generate a completion from the specified model"""
         try:
             # Use provided temperature or default from valves
             if temperature is None:
                 temperature = self.valves.TEMPERATURE
+
+            # Enforce output language if configured
+            # This hint is only applied to user-facing responses so that all internal
+            # research prompts, queries, and planning remain in English.
+            output_lang = getattr(self.valves, "OUTPUT_LANGUAGE", "auto") or "auto"
+            output_lang = output_lang.lower()
+            if user_facing and output_lang != "auto":
+                if output_lang in ("pl", "polish"):
+                    lang_hint = (
+                        "Pisz wszystkie odpowiedzi wyłącznie po polsku, "
+                        "nie używaj innych języków."
+                    )
+                elif output_lang in ("en", "english"):
+                    lang_hint = (
+                        "Write all responses only in English and do not "
+                        "use other languages."
+                    )
+                else:
+                    lang_hint = (
+                        f"Write all responses only in {output_lang} and do not "
+                        "use other languages."
+                    )
+
+                # Try to prepend language hint to the first system message
+                system_found = False
+                for msg in messages:
+                    if msg.get("role") == "system":
+                        original = msg.get("content", "")
+                        msg["content"] = f"{lang_hint}\n\n{original}"
+                        system_found = True
+                        break
+
+                # If no system message exists, add one
+                if not system_found:
+                    messages.insert(
+                        0,
+                        {
+                            "role": "system",
+                            "content": lang_hint,
+                        },
+                    )
 
             form_data = {
                 "model": model,
@@ -5957,22 +6126,43 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
         # Prepare the outline display
         outline_display = "\n".join(numbered_outline)
 
+        # Choose language for user-facing instructions based on OUTPUT_LANGUAGE
+        output_lang = (self.valves.OUTPUT_LANGUAGE or "auto").lower()
+        is_pl = output_lang in ("pl", "polish")
+
         # Emit a message with instructions using improved slash commands
-        feedback_message = (
-            "### Research Outline\n\n"
-            f"{outline_display}\n\n"
-            "**Please provide feedback on this research outline.**\n\n"
-            "You can:\n"
-            "- Use commands like `/keep 1,3,5-7` or `/remove 2,4,8-10` to select specific items by number\n"
-            "- Or simply describe what topics you want to focus on or avoid in natural language\n\n"
-            "Examples:\n"
-            "- `/k 1,3,5-7` (keep only items 1,3,5,6,7)\n"
-            "- `/r 2,4,8-10` (remove items 2,4,8,9,10)\n"
-            '- "Focus on historical aspects and avoid technical details"\n'
-            '- "I\'m more interested in practical applications than theoretical concepts"\n\n'
-            "If you want to continue with all items, just reply 'continue' or leave your message empty.\n\n"
-            "**I'll pause here to await your response before continuing the research.**"
-        )
+        if is_pl:
+            feedback_message = (
+                "### Plan badań\n\n"
+                f"{outline_display}\n\n"
+                "**Proszę o Twoją opinię na temat tego planu badań.**\n\n"
+                "Możesz:\n"
+                "- Użyć komend takich jak `/keep 1,3,5-7` lub `/remove 2,4,8-10`, aby wybrać konkretne pozycje po numerze\n"
+                "- Albo po prostu opisać po polsku, na których tematach chcesz się skupić, a których wolisz uniknąć\n\n"
+                "Przykłady:\n"
+                "- `/k 1,3,5-7` (zachowaj tylko pozycje 1,3,5,6,7)\n"
+                "- `/r 2,4,8-10` (usuń pozycje 2,4,8,9,10)\n"
+                '- "Skup się na aspektach historycznych i pomiń szczegóły techniczne"\n'
+                '- "Bardziej interesują mnie praktyczne zastosowania niż koncepcje teoretyczne"\n\n'
+                "Jeśli chcesz kontynuować ze wszystkimi pozycjami, odpowiedz po prostu \"continue\" albo wyślij pustą wiadomość.\n\n"
+                "**Zatrzymuję się tutaj i czekam na Twoją odpowiedź, zanim przejdziemy dalej z badaniami.**"
+            )
+        else:
+            feedback_message = (
+                "### Research Outline\n\n"
+                f"{outline_display}\n\n"
+                "**Please provide feedback on this research outline.**\n\n"
+                "You can:\n"
+                "- Use commands like `/keep 1,3,5-7` or `/remove 2,4,8-10` to select specific items by number\n"
+                "- Or simply describe what topics you want to focus on or avoid in natural language\n\n"
+                "Examples:\n"
+                "- `/k 1,3,5-7` (keep only items 1,3,5,6,7)\n"
+                "- `/r 2,4,8-10` (remove items 2,4,8,9,10)\n"
+                "- \"Focus on historical aspects and avoid technical details\"\n"
+                "- \"I'm more interested in practical applications than theoretical concepts\"\n\n"
+                "If you want to continue with all items, just reply 'continue' or leave your message empty.\n\n"
+                "**I'll pause here to await your response before continuing the research.**"
+            )
 
         await self.emit_message(feedback_message)
 
@@ -9580,10 +9770,12 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
                             logger.warning(
                                 f"Failed to get embedding for '{query}', using default"
                             )
-                            query_embedding = [0] * 384  # Default embedding size
+                            fallback_dim = self.embedding_dim or 384
+                            query_embedding = [0.0] * fallback_dim
                     except Exception as e:
                         logger.error(f"Error getting embedding: {e}")
-                        query_embedding = [0] * 384  # Default embedding size
+                        fallback_dim = self.embedding_dim or 384
+                        query_embedding = [0.0] * fallback_dim
 
                     # Process the query and get results
                     results = await self.process_query(
@@ -9795,10 +9987,12 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
                             logger.warning(
                                 f"Failed to get embedding for '{query}', using default"
                             )
-                            query_embedding = [0] * 384  # Default embedding size
+                            fallback_dim = self.embedding_dim or 384
+                            query_embedding = [0.0] * fallback_dim
                     except Exception as e:
                         logger.error(f"Error getting embedding: {e}")
-                        query_embedding = [0] * 384  # Default embedding size
+                        fallback_dim = self.embedding_dim or 384
+                        query_embedding = [0.0] * fallback_dim
 
                     # Process the query and get results
                     results = await self.process_query(
@@ -10131,10 +10325,12 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
                 try:
                     query_embedding = await self.get_embedding(query)
                     if not query_embedding:
-                        query_embedding = [0] * 384  # Default embedding size
+                        fallback_dim = self.embedding_dim or 384
+                        query_embedding = [0.0] * fallback_dim
                 except Exception as e:
                     logger.error(f"Error getting embedding: {e}")
-                    query_embedding = [0] * 384  # Default embedding size
+                    fallback_dim = self.embedding_dim or 384
+                    query_embedding = [0.0] * fallback_dim
 
                 # Apply semantic transformation if available
                 semantic_transformations = state.get("semantic_transformations")
@@ -10310,47 +10506,122 @@ Format your response as a valid JSON object with the following structure:
                         "remaining": set(active_outline),
                     }
 
-                    # Display analysis to the user
-                    analysis_text = f"### Research Analysis (Cycle {cycle})\n\n"
-                    analysis_text += f"{analysis_data.get('analysis', 'Analysis not available.')}\n\n"
+                    # Display analysis to the user, localized based on OUTPUT_LANGUAGE
+                    output_lang = (self.valves.OUTPUT_LANGUAGE or "auto").lower()
+                    is_pl = output_lang in ("pl", "polish")
 
+                    if is_pl:
+                        analysis_heading = f"### Analiza badań (cykl {cycle})\n\n"
+                        base_analysis = analysis_data.get(
+                            "analysis", "Analiza niedostępna."
+                        )
+                        completed_label = "**Zrealizowane tematy:**\n"
+                        partial_label = "**Tematy częściowo opracowane:**\n"
+                        irrelevant_label = (
+                            "**Tematy nieistotne / rozpraszające:**\n"
+                        )
+                        new_label = "**Nowe odkryte tematy:**\n"
+                        remaining_label = "**Pozostałe tematy:**\n"
+                        more_suffix = " więcej"
+                    else:
+                        analysis_heading = f"### Research Analysis (Cycle {cycle})\n\n"
+                        base_analysis = analysis_data.get(
+                            "analysis", "Analysis not available."
+                        )
+                        completed_label = "**Topics Completed:**\n"
+                        partial_label = "**Topics Partially Addressed:**\n"
+                        irrelevant_label = "**Irrelevant/Distraction Topics:**\n"
+                        new_label = "**New Topics Discovered:**\n"
+                        remaining_label = "**Remaining Topics:**\n"
+                        more_suffix = " more"
+
+                    analysis_text = analysis_heading
+                    analysis_text += f"{base_analysis}\n\n"
+
+                    # Collapsible section for search results from this cycle
+                    results_details = ""
+                    if cycle_results:
+                        for i, result in enumerate(cycle_results):
+                            title = result.get("title", "N/A")
+                            url = result.get("url", "N/A")
+                            query = result.get("query", "N/A")
+                            content_summary = result.get("content", "")
+                            summary_preview = (
+                                (content_summary[:300] + "...")
+                                if len(content_summary) > 300
+                                else content_summary
+                            )
+
+                            results_details += f"**Result {i+1}: {title}**\n"
+                            results_details += f"URL: {url}\n"
+                            results_details += f"Query: '{query}'\n"
+                            results_details += f"Summary: {summary_preview}\n\n"
+
+                        if results_details:
+                            results_summary = (
+                                f"Pokaż {len(cycle_results)} wyników z tego cyklu"
+                                if is_pl
+                                else f"View {len(cycle_results)} search results from this cycle"
+                            )
+                            analysis_text += (
+                                f"<details>\n<summary>{results_summary}</summary>\n\n"
+                                f"{results_details}</details>\n\n"
+                            )
+
+                    # Collapsible section for detailed topic updates
+                    topic_details = ""
                     if newly_completed:
-                        analysis_text += "**Topics Completed:**\n"
+                        topic_details += completed_label
                         for topic in newly_completed:
-                            analysis_text += f"✓ {topic}\n"
-                        analysis_text += "\n"
+                            topic_details += f"✓ {topic}\n"
+                        topic_details += "\n"
 
                     if analysis_data.get("partial_topics"):
                         partial_topics = analysis_data.get("partial_topics")
-                        analysis_text += "**Topics Partially Addressed:**\n"
+                        topic_details += partial_label
                         # Show only first 5 partial topics
                         for topic in partial_topics[:5]:
-                            analysis_text += f"⚪ {topic}\n"
+                            topic_details += f"⚪ {topic}\n"
                         # Add count of additional topics if there are more than 5
                         if len(partial_topics) > 5:
-                            analysis_text += f"...and {len(partial_topics) - 5} more\n"
-                        analysis_text += "\n"
+                            topic_details += (
+                                f"...and {len(partial_topics) - 5}{more_suffix}\n"
+                            )
+                        topic_details += "\n"
 
                     # Add display for irrelevant topics
                     if newly_irrelevant:
-                        analysis_text += "**Irrelevant/Distraction Topics:**\n"
+                        topic_details += irrelevant_label
                         for topic in newly_irrelevant:
-                            analysis_text += f"✗ {topic}\n"
-                        analysis_text += "\n"
+                            topic_details += f"✗ {topic}\n"
+                        topic_details += "\n"
 
                     if new_topics:
-                        analysis_text += "**New Topics Discovered:**\n"
+                        topic_details += new_label
                         for topic in new_topics:
-                            analysis_text += f"+ {topic}\n"
-                        analysis_text += "\n"
+                            topic_details += f"+ {topic}\n"
+                        topic_details += "\n"
 
                     if active_outline:
-                        analysis_text += "**Remaining Topics:**\n"
+                        topic_details += remaining_label
                         for topic in active_outline[:5]:  # Show just the first 5
-                            analysis_text += f"□ {topic}\n"
+                            topic_details += f"□ {topic}\n"
                         if len(active_outline) > 5:
-                            analysis_text += f"...and {len(active_outline) - 5} more\n"
-                        analysis_text += "\n"
+                            topic_details += (
+                                f"...and {len(active_outline) - 5}{more_suffix}\n"
+                            )
+                        topic_details += "\n"
+
+                    if topic_details:
+                        topic_summary = (
+                            "Pokaż szczegółowe aktualizacje tematów"
+                            if is_pl
+                            else "View detailed topic updates"
+                        )
+                        analysis_text += (
+                            f"<details>\n<summary>{topic_summary}</summary>\n\n"
+                            f"{topic_details}</details>\n\n"
+                        )
 
                     # Store dimension coverage in state but don't display it during cycles
                     research_dimensions = state.get("research_dimensions")
@@ -11003,7 +11274,7 @@ Format your response as a valid JSON object with the following structure:
 class TrajectoryAccumulator:
     """Efficiently accumulates research trajectory across cycles"""
 
-    def __init__(self, embedding_dim=384):
+    def __init__(self, embedding_dim=1024):
         self.query_sum = np.zeros(embedding_dim)
         self.result_sum = np.zeros(embedding_dim)
         self.count = 0
