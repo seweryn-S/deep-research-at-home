@@ -1,5 +1,6 @@
 # Original work by GitHub user atineiatte (2024)
 # Modifications by Seweryn Sitarski (2025)
+# Version: 0.2.0
 
 # Licensed under the Apache License, Version 2.0 (the "License");
 # You may not use this file except in compliance with the License.
@@ -32,6 +33,8 @@ from sklearn.cluster import KMeans
 from open_webui.constants import TASKS
 from open_webui.main import generate_chat_completions
 from open_webui.models.users import User
+from aiohttp.client_exceptions import ClientPayloadError
+from aiohttp.http_exceptions import ContentLengthError
 
 name = "Deep Research at Home"
 
@@ -152,7 +155,12 @@ class ResearchStateManager:
                 "outline_feedback_data": None,
                 "research_state": None,
                 "follow_up_mode": False,
-                "user_preferences": {"pdv": None, "strength": 0.0, "impact": 0.0},
+                "user_preferences": {
+                    "pdv": None,
+                    "strength": 0.0,
+                    "impact": 0.0,
+                    "labels": "",
+                },
                 "research_dimensions": None,
                 "research_trajectory": None,
                 "pdv_alignment_history": [],
@@ -433,6 +441,10 @@ class Pipe:
             ge=1,
             le=50,
         )
+        DEBUG_LLM: bool = Field(
+            default=False,
+            description="Enable detailed logging of LLM requests/responses (truncated for safety)",
+        )
 
     def __init__(self):
         self.type = "manifold"
@@ -445,8 +457,6 @@ class Pipe:
         # Shared resources (not conversation-specific)
         self.embedding_cache = EmbeddingCache(max_size=10000000)
         self.transformation_cache = TransformationCache(max_size=2500000)
-        self.vocabulary_cache = None
-        self.vocabulary_embeddings = None
         self.is_pdf_content = False
         self.research_date = None
         self.trajectory_accumulator = None
@@ -730,195 +740,6 @@ class Pipe:
             self.transformation_cache.set(text, transform_id, transformed)
 
         return transformed
-
-    async def create_context_vocabulary(
-        self, context_text: str, min_size: int = 1000
-    ) -> List[str]:
-        """Create a vocabulary from recent context when standard vocabulary is unavailable"""
-        logger.info("Creating vocabulary from context as fallback")
-
-        # Extract words from context
-        words = re.findall(r"\b[a-zA-Z]{4,}\b", context_text.lower())
-
-        # Get unique words
-        unique_words = list(set(words))
-        logger.info(f"Created context vocabulary with {len(unique_words)} words")
-
-        return unique_words
-
-    async def load_vocabulary(self):
-        """Load the 10,000 word vocabulary for semantic analysis"""
-        if self.vocabulary_cache is not None:
-            return self.vocabulary_cache
-
-        try:
-            url = "https://www.mit.edu/~ecprice/wordlist.10000"
-            connector = aiohttp.TCPConnector(force_close=True)
-            async with aiohttp.ClientSession(connector=connector) as session:
-                async with session.get(url, timeout=10) as response:
-                    if response.status == 200:
-                        text = await response.text()
-                        self.vocabulary_cache = [
-                            word.strip() for word in text.splitlines() if word.strip()
-                        ]
-                        logger.info(
-                            f"Loaded {len(self.vocabulary_cache)} words vocabulary"
-                        )
-                        return self.vocabulary_cache
-        except Exception as e:
-            logger.error(f"Error loading vocabulary: {e}")
-
-            # Use context to create a vocabulary if standard one is unavailable
-            # Get recent context from results history or any available text
-            context_text = ""
-            state = self.get_state()
-            results_history = state.get("results_history", [])
-            search_history = state.get("search_history", [])
-            section_synthesized_content = state.get("section_synthesized_content", {})
-
-            if results_history:
-                # Use the last few results
-                for result in results_history[-5:]:
-                    context_text += result.get("content", "") + " "
-
-            # Add any research queries
-            if search_history:
-                context_text += " ".join(search_history) + " "
-
-            # Add any section content
-            if section_synthesized_content:
-                for content in list(section_synthesized_content.values())[:3]:
-                    context_text += content + " "
-
-            # If we still don't have enough context, just proceed with failure logging
-            if len(context_text) < 5000:
-                logger.error("Insufficient context for vocabulary creation")
-                return None
-
-            # Create vocabulary from context
-            self.vocabulary_cache = await self.create_context_vocabulary(context_text)
-            return self.vocabulary_cache
-
-    async def load_prebuilt_vocabulary_embeddings(self):
-        """Download and load pre-built vocabulary embeddings from GitHub"""
-        try:
-            import gzip
-            import json
-            import tempfile
-            import os
-
-            logger.info("Attempting to download pre-built vocabulary embeddings")
-            url = "https://github.com/atineiatte/deep-research-at-home/raw/main/granite30m%20mit%2010k.gz"
-
-            # Download the compressed file
-            connector = aiohttp.TCPConnector(force_close=True)
-            async with aiohttp.ClientSession(connector=connector) as session:
-                async with session.get(url, timeout=30) as response:
-                    if response.status == 200:
-                        # Create a temporary file
-                        with tempfile.NamedTemporaryFile(delete=False) as temp_file:
-                            temp_filename = temp_file.name
-                            # Write the compressed data to the temporary file
-                            temp_file.write(await response.read())
-
-                        # Decompress and load the embeddings
-                        try:
-                            with gzip.open(temp_filename, "rt", encoding="utf-8") as f:
-                                data = json.load(f)
-
-                            # Clean up the temporary file
-                            os.unlink(temp_filename)
-
-                            # Convert the data to the expected format
-                            self.vocabulary_cache = []
-                            self.vocabulary_embeddings = {}
-
-                            for word, embedding in data.items():
-                                self.vocabulary_cache.append(word)
-                                self.vocabulary_embeddings[word] = embedding
-
-                            logger.info(
-                                f"Successfully loaded {len(self.vocabulary_embeddings)} pre-built vocabulary embeddings"
-                            )
-
-                            # Store in state for persistence across calls
-                            self.update_state(
-                                "vocabulary_embeddings", self.vocabulary_embeddings
-                            )
-
-                            return self.vocabulary_embeddings
-                        except Exception as e:
-                            logger.error(
-                                f"Error decompressing or parsing embeddings: {e}"
-                            )
-                            # Clean up the temporary file if it exists
-                            if os.path.exists(temp_filename):
-                                os.unlink(temp_filename)
-                    else:
-                        logger.warning(
-                            f"Failed to download pre-built embeddings: HTTP {response.status}"
-                        )
-
-            # If we get here, something went wrong - fall back to original method
-            logger.info("Falling back to on-demand vocabulary embedding generation")
-            return await self.load_vocabulary_embeddings()
-
-        except Exception as e:
-            logger.error(f"Error downloading pre-built vocabulary embeddings: {e}")
-            # Fall back to the original method
-            logger.info("Falling back to on-demand vocabulary embedding generation")
-            return await self.load_vocabulary_embeddings()
-
-    async def load_vocabulary_embeddings(self):
-        """Get embeddings for vocabulary words using the current embedding model.
-
-        This implementation always computes embeddings on the fly using
-        `get_embedding` instead of loading a pre-built file, so it stays
-        compatible with whatever embedding model is configured.
-        """
-        # If we already have the embeddings, return them
-        if self.vocabulary_embeddings is not None:
-            return self.vocabulary_embeddings
-
-        # Check if we have them in state
-        state = self.get_state()
-        cached_embeddings = state.get("vocabulary_embeddings")
-        if cached_embeddings:
-            self.vocabulary_embeddings = cached_embeddings
-            logger.info(
-                f"Loaded {len(self.vocabulary_embeddings)} vocabulary embeddings from state"
-            )
-            return self.vocabulary_embeddings
-
-        # If pre-built embeddings failed, load vocabulary and generate embeddings
-        vocab = await self.load_vocabulary()
-        if not vocab:
-            logger.error("Failed to load vocabulary for embeddings")
-            return {}
-
-        self.vocabulary_embeddings = {}
-
-        # Log the start of embedding process
-        logger.info(f"Preloading embeddings for {len(vocab)} vocabulary words")
-
-        # Process words sequentially
-        for i, word in enumerate(vocab):
-            if i % 100 == 0:  # Log progress every 100 words
-                logger.info(f"Processing vocabulary word {i}/{len(vocab)}")
-
-            # Get embedding for this word
-            embedding = await self.get_embedding(word)
-            if embedding:
-                self.vocabulary_embeddings[word] = embedding
-
-        logger.info(
-            f"Generated embeddings for {len(self.vocabulary_embeddings)} vocabulary words"
-        )
-
-        # Store in state for persistence across calls
-        self.update_state("vocabulary_embeddings", self.vocabulary_embeddings)
-
-        return self.vocabulary_embeddings
 
     def chunk_text(self, text: str) -> List[str]:
         """Split text into chunks based on the configured chunk level"""
@@ -2816,6 +2637,159 @@ class Pipe:
         )
         return impact
 
+    async def summarize_preferences_from_items(
+        self, kept_items: List[str], removed_items: List[str]
+    ) -> Optional[str]:
+        """Summarize user preferences from kept and removed items using the LLM"""
+        if not kept_items and not removed_items:
+            return None
+
+        try:
+            max_examples = 10
+            kept_sample = kept_items[:max_examples]
+            removed_sample = removed_items[:max_examples]
+
+            kept_block = "\n".join([f"- {item}" for item in kept_sample]) or "None"
+            removed_block = (
+                "\n".join([f"- {item}" for item in removed_sample]) or "None"
+            )
+
+            synthesis_model = self.get_synthesis_model()
+
+            system_prompt = (
+                "You analyze how a user selects or rejects research topics.\n"
+                "From the kept vs removed examples, infer what kinds of topics the user prefers.\n"
+                "Respond in the same language as most of the items (for example Polish or English).\n"
+                "Return 1 to 3 short labels, 2–5 words each, separated by commas.\n"
+                "Do not add explanations, numbering, or extra text."
+            )
+
+            user_prompt = (
+                "Here are examples of topics the user decided to keep or remove.\n\n"
+                "Kept topics:\n"
+                f"{kept_block}\n\n"
+                "Removed topics:\n"
+                f"{removed_block}\n\n"
+                "Based on these examples, describe the user's main preferences as short labels "
+                "separated by commas."
+            )
+
+            messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ]
+
+            response = await self.generate_completion(
+                synthesis_model,
+                messages,
+                temperature=self.valves.SYNTHESIS_TEMPERATURE,
+                user_facing=True,
+            )
+
+            if not response or "choices" not in response or not response["choices"]:
+                return None
+
+            raw_text = response["choices"][0]["message"]["content"]
+            if not raw_text:
+                return None
+
+            first_line = raw_text.split("\n")[0].strip()
+            first_line = first_line.lstrip("-•*").strip()
+            if (
+                len(first_line) >= 2
+                and first_line[0] in ("'", '"')
+                and first_line[-1] == first_line[0]
+            ):
+                first_line = first_line[1:-1].strip()
+
+            return first_line or None
+        except Exception as e:
+            logger.error(f"Error summarizing user preferences from items: {e}")
+            return None
+
+    def _looks_like_metadata_query(self, text: str) -> bool:
+        """Heuristic filter for strings that are likely API metadata, not real search queries."""
+        if not text:
+            return True
+
+        value = text.strip()
+        lower = value.lower()
+
+        # Obvious metadata keys or boilerplate
+        meta_tokens = {
+            "id",
+            "object",
+            "created",
+            "model",
+            "choices",
+            "usage",
+            "role",
+            "content",
+            "system_fingerprint",
+            "index",
+        }
+        if lower in meta_tokens:
+            return True
+
+        # Very short single words are unlikely to be good queries
+        if " " not in lower and len(lower) <= 3:
+            return True
+
+        # Model / engine names and similar identifiers
+        engine_markers = ["gpt-oss", "gpt-", "gpt4", "gpt-4", "ollama", "text-davinci"]
+        if any(marker in lower for marker in engine_markers):
+            return True
+
+        # Likely UUIDs or hex IDs
+        import re
+
+        if re.fullmatch(r"[0-9a-f\-]{16,}", lower):
+            return True
+
+        return False
+
+    def _extract_queries_from_llm_response(
+        self, query_content: str, user_message: str, max_queries: int = 3
+    ) -> List[str]:
+        """Robust fallback to extract reasonable query-like strings from an LLM response."""
+        import re
+
+        candidates: List[str] = []
+
+        # 1) Prefer bullet/numbered list lines – typical pattern for queries
+        for line in query_content.splitlines():
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if re.match(r"^[-*]\s+", stripped) or re.match(r"^\d+\.\s+", stripped):
+                candidate = re.sub(r"^([-*]|\d+\.)\s*", "", stripped)
+                if candidate and not self._looks_like_metadata_query(candidate):
+                    candidates.append(candidate)
+
+        # 2) If that fails, fall back to quoted strings but filter aggressively
+        if not candidates:
+            all_strings = re.findall(r'"([^"]+)"', query_content)
+            for s in all_strings:
+                if self._looks_like_metadata_query(s):
+                    continue
+                candidates.append(s)
+
+        # 3) Last-resort fallback: generic query from the original user message
+        if not candidates:
+            return [f"Information about {user_message}"]
+
+        # De-duplicate while preserving order
+        seen = set()
+        cleaned: List[str] = []
+        for c in candidates:
+            normalized = c.strip()
+            if not normalized or normalized.lower() in seen:
+                continue
+            seen.add(normalized.lower())
+            cleaned.append(normalized)
+
+        return cleaned[:max_queries]
+
     async def calculate_preference_direction_vector(
         self, kept_items: List[str], removed_items: List[str], all_topics: List[str]
     ) -> Dict:
@@ -2877,40 +2851,54 @@ class Pipe:
                 kept_items, removed_items, all_topics
             )
 
-            return {"pdv": pdv.tolist(), "strength": float(strength), "impact": impact}
+            result = {
+                "pdv": pdv.tolist(),
+                "strength": float(strength),
+                "impact": impact,
+            }
+
+            try:
+                preference_labels = await self.summarize_preferences_from_items(
+                    kept_items, removed_items
+                )
+            except Exception as e:
+                logger.error(f"Error generating preference labels: {e}")
+                preference_labels = None
+
+            if preference_labels:
+                result["labels"] = preference_labels
+
+            return result
         except Exception as e:
             logger.error(f"Error calculating PDV: {e}")
             return {"pdv": None, "strength": 0.0, "impact": 0.0}
 
     async def translate_pdv_to_words(self, pdv):
-        """Translate a Preference Direction Vector (PDV) into human-readable concepts using vocabulary embeddings"""
+        """Translate a Preference Direction Vector (PDV) into human-readable concepts using stored preference labels"""
         if not pdv:
             return None
 
-        # Ensure we have vocabulary embeddings
-        if not self.vocabulary_embeddings:
-            # If not loaded yet, load them now
-            self.vocabulary_embeddings = await self.load_vocabulary_embeddings()
-
-        if not self.vocabulary_embeddings:
-            return None
-
         try:
-            # Convert PDV to numpy array
-            pdv_array = np.array(pdv)
+            state = self.get_state()
+            user_preferences = state.get(
+                "user_preferences", {"pdv": None, "strength": 0.0, "impact": 0.0}
+            )
 
-            # Find vocabulary words that align with this direction
-            word_alignments = []
-            for word, embedding in self.vocabulary_embeddings.items():
-                # Calculate alignment (dot product) with PDV
-                alignment = np.dot(pdv_array, embedding)
-                word_alignments.append((word, alignment))
+            labels = user_preferences.get("labels")
+            if labels:
+                return labels
 
-            # Get top aligned words (highest dot product)
-            top_words = sorted(word_alignments, key=lambda x: x[1], reverse=True)[:10]
+            feedback = state.get("last_preference_feedback")
+            if feedback:
+                labels = await self.summarize_preferences_from_items(
+                    feedback.get("kept_items", []), feedback.get("removed_items", [])
+                )
+                if labels:
+                    user_preferences["labels"] = labels
+                    self.update_state("user_preferences", user_preferences)
+                return labels
 
-            # Return as comma-separated string
-            return ", ".join([word for word, _ in top_words])
+            return None
         except Exception as e:
             logger.error(f"Error translating PDV to words: {e}")
             return None
@@ -3033,6 +3021,7 @@ class Pipe:
                             synthesis_model,
                             messages,
                             temperature=self.valves.SYNTHESIS_TEMPERATURE,
+                            user_facing=True,
                         )
                         raw_label = (
                             response["choices"][0]["message"]["content"]
@@ -5692,6 +5681,32 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
                         },
                     )
 
+            debug_llm = getattr(self.valves, "DEBUG_LLM", False)
+            if debug_llm:
+                # Truncate content to avoid noisy logs
+                def _shorten(text: Any, limit: int = 400) -> str:
+                    try:
+                        s = str(text)
+                    except Exception:
+                        return "<unprintable>"
+                    return s if len(s) <= limit else s[:limit] + "...[truncated]"
+
+                preview_messages = []
+                for msg in messages:
+                    preview_messages.append(
+                        {
+                            "role": msg.get("role"),
+                            "content": _shorten(msg.get("content", "")),
+                        }
+                    )
+                logger.info(
+                    "LLM DEBUG request model=%s temperature=%.3f stream=%s messages=%s",
+                    model,
+                    temperature,
+                    stream,
+                    preview_messages,
+                )
+
             form_data = {
                 "model": model,
                 "messages": messages,
@@ -5706,11 +5721,145 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
                 user=self.__user__,
             )
 
-            return response
+            normalized = await self._normalize_completion_response(response)
+
+            if debug_llm:
+                # Try to extract the main assistant content for debugging
+                try:
+                    content = ""
+                    if normalized and "choices" in normalized and normalized["choices"]:
+                        content = normalized["choices"][0]["message"].get(
+                            "content", ""
+                        )
+                    logger.info(
+                        "LLM DEBUG response model=%s content=%s",
+                        model,
+                        _shorten(content),
+                    )
+                except Exception as e:
+                    logger.info(f"LLM DEBUG response logging failed: {e}")
+
+            return normalized
         except Exception as e:
             logger.error(f"Error generating completion with model {model}: {e}")
             # Return a minimal valid response structure
             return {"choices": [{"message": {"content": f"Error: {str(e)}"}}]}
+
+    def _chunk_to_bytes(self, chunk: Any) -> bytes:
+        if chunk is None:
+            return b""
+        if isinstance(chunk, bytes):
+            return chunk
+        if isinstance(chunk, str):
+            return chunk.encode("utf-8", "replace")
+        return str(chunk).encode("utf-8", "replace")
+
+    async def _read_response_body(self, response: Any) -> bytes:
+        if response is None:
+            return b""
+
+        # Streaming responses expose body_iterator
+        iterator = getattr(response, "body_iterator", None)
+        if iterator is not None:
+            chunks: List[bytes] = []
+            try:
+                async for chunk in iterator:
+                    chunks.append(self._chunk_to_bytes(chunk))
+            except TypeError:
+                for chunk in iterator:
+                    chunks.append(self._chunk_to_bytes(chunk))
+            return b"".join(chunks)
+
+        # Standard responses often expose .body
+        body = getattr(response, "body", None)
+        if asyncio.iscoroutine(body):
+            body = await body
+        if body is not None:
+            return self._chunk_to_bytes(body)
+
+        # Fallback to .content
+        content = getattr(response, "content", None)
+        if asyncio.iscoroutine(content):
+            content = await content
+        if content is not None:
+            return self._chunk_to_bytes(content)
+
+        return self._chunk_to_bytes(response)
+
+    async def _normalize_completion_response(self, response: Any) -> Dict[str, Any]:
+        if isinstance(response, dict):
+            return response
+        if isinstance(response, str):
+            try:
+                return json.loads(response)
+            except json.JSONDecodeError:
+                return {"choices": [{"message": {"content": response}}]}
+
+        body_bytes = await self._read_response_body(response)
+
+        # Close response objects if they expose a close coroutine/callable
+        close_method = getattr(response, "close", None)
+        if callable(close_method):
+            try:
+                close_result = close_method()
+                if asyncio.iscoroutine(close_result):
+                    await close_result
+            except Exception as close_error:
+                logger.debug(f"Error closing completion response: {close_error}")
+
+        if not body_bytes:
+            return {"choices": [{"message": {"content": ""}}]}
+
+        try:
+            decoded = body_bytes.decode("utf-8", "replace")
+
+            # Handle streaming-style "data: {...}" payloads by concatenating deltas
+            if decoded.strip().startswith("data:") or "data:" in decoded:
+                content_chunks = []
+                finish_reason = None
+                try:
+                    for line in decoded.splitlines():
+                        line = line.strip()
+                        if not line.startswith("data:"):
+                            continue
+                        payload = line[len("data:") :].strip()
+                        if not payload or payload == "[DONE]":
+                            continue
+                        try:
+                            obj = json.loads(payload)
+                        except json.JSONDecodeError:
+                            continue
+
+                        choices = obj.get("choices") or []
+                        if not choices:
+                            continue
+
+                        delta = choices[0].get("delta") or choices[0].get("message") or {}
+                        piece = delta.get("content") or delta.get("reasoning_content")
+                        if piece:
+                            content_chunks.append(piece)
+
+                        fr = choices[0].get("finish_reason")
+                        if fr:
+                            finish_reason = fr
+
+                    if content_chunks:
+                        return {
+                            "choices": [
+                                {
+                                    "message": {"content": "".join(content_chunks)},
+                                    "finish_reason": finish_reason,
+                                }
+                            ]
+                        }
+                except Exception as e:
+                    logger.debug(f"Streaming response parse failed: {e}")
+
+            # Non-streaming JSON payload
+            return json.loads(decoded)
+        except json.JSONDecodeError:
+            decoded = body_bytes.decode("utf-8", "replace")
+            return {"choices": [{"message": {"content": decoded}}]}
 
     async def emit_message(self, message: str):
         """Emit a message to the client"""
@@ -6643,6 +6792,7 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
                 extraction_messages,
                 temperature=self.valves.TEMPERATURE
                 * 0.4,  # Lower temperature for factual extraction
+                user_facing=True,
             )
 
             if response and "choices" in response and len(response["choices"]) > 0:
@@ -6699,6 +6849,7 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
                 refine_messages,
                 temperature=self.valves.TEMPERATURE
                 * 0.7,  # Balanced temperature for creativity with focus
+                user_facing=True,
             )
 
             if response and "choices" in response and len(response["choices"]) > 0:
@@ -7252,6 +7403,7 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
                 self.get_research_model(),
                 [title_prompt, message],
                 temperature=0.7,
+                user_facing=True,
             )
 
             title = response["choices"][0]["message"]["content"].strip()
@@ -7791,6 +7943,7 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
                 messages,
                 stream=False,
                 temperature=scaled_temperature,
+                user_facing=True,
             )
 
             if response and "choices" in response and len(response["choices"]) > 0:
@@ -8266,6 +8419,7 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
                 stream=False,
                 temperature=self.valves.SYNTHESIS_TEMPERATURE
                 * 0.7,  # Lower temperature for editing
+                user_facing=True,
             )
 
             if response and "choices" in response and len(response["choices"]) > 0:
@@ -9210,6 +9364,7 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
                 messages,
                 temperature=self.valves.TEMPERATURE
                 * 1.1,  # Slightly higher temperature for creative replacements
+                user_facing=True,
             )
 
             if response and "choices" in response and len(response["choices"]) > 0:
@@ -9388,6 +9543,7 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
                 research_model,
                 [titles_prompt, {"role": "user", "content": titles_context}],
                 temperature=0.7,  # Allow some creativity for titles
+                user_facing=True,
             )
 
             if response and "choices" in response and len(response["choices"]) > 0:
@@ -9473,6 +9629,7 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
                     synthesis_model,
                     [abstract_prompt, {"role": "user", "content": abstract_context}],
                     temperature=self.valves.SYNTHESIS_TEMPERATURE,
+                    user_facing=True,
                 ),
                 timeout=300,  # 5 minute timeout
             )
@@ -9570,10 +9727,6 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
         from datetime import datetime
 
         self.research_date = datetime.now().strftime("%Y-%m-%d")
-
-        # Preload vocabulary embeddings in background as soon as possible
-        self.vocabulary_embeddings = None  # Force reload
-        asyncio.create_task(self.load_prebuilt_vocabulary_embeddings())
 
         # Get state for this conversation
         state = self.get_state()
@@ -9704,16 +9857,19 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
                 initial_query_prompt = {
                     "role": "system",
                     "content": """You are a post-grad research assistant generating effective search queries for continued research based on an existing report.
-	Based on the user's follow-up question and the previous research summary, generate 6 initial search queries.
-	Each query should be specific, use relevant keywords, and be designed to find new information that builds on the previous research towards the new query.
+    Based on the user's follow-up question and the previous research summary, generate 6 initial search queries.
+    Each query should be specific, use relevant keywords, and be designed to find new information that builds on the previous research towards the new query.
     Use quotes sparingly and as a last resort. Never use multiple sets of quotes in the same query.
-	
-	Format your response as a valid JSON object with the following structure:
-	{"queries": [
-	  "search query 1", 
-	  "search query 2",
-	  "search query 3"
-	]}""",
+
+    Respond ONLY with a valid JSON object and nothing else (no prose, no code fences, no metadata, no model names, no IDs).
+    JSON schema:
+    {"queries": [
+      "search query 1",
+      "search query 2",
+      "search query 3"
+    ]}
+    If unsure, return a minimal valid JSON with one query derived from the user message.
+    Start the response with '{' and end with '}'.""",
                 }
 
                 initial_query_messages = [
@@ -9729,6 +9885,7 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
                     self.get_research_model(),
                     initial_query_messages,
                     temperature=self.valves.TEMPERATURE,
+                    user_facing=True,
                 )
                 query_content = query_response["choices"][0]["message"]["content"]
 
@@ -9738,15 +9895,30 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
                         query_content.find("{") : query_content.rfind("}") + 1
                     ]
                     query_data = json.loads(query_json_str)
-                    initial_queries = query_data.get("queries", [])
+                    raw_queries = query_data.get("queries", [])
+
+                    # Normalize different possible formats to a list of strings
+                    initial_queries: List[str] = []
+                    if isinstance(raw_queries, list):
+                        for q in raw_queries:
+                            if isinstance(q, str):
+                                initial_queries.append(q)
+                            elif isinstance(q, dict):
+                                candidate = q.get("query")
+                                if isinstance(candidate, str):
+                                    initial_queries.append(candidate)
+
+                    # If we didn't get any usable queries from JSON, trigger fallback
+                    if not initial_queries or any(
+                        self._looks_like_metadata_query(q) for q in initial_queries
+                    ):
+                        raise ValueError("No valid queries in JSON response")
                 except (json.JSONDecodeError, ValueError) as e:
                     logger.error(f"Error parsing query JSON: {e}")
-                    # Fallback: extract queries using regex if JSON parsing fails
-                    import re
-
-                    initial_queries = re.findall(r'"([^"]+)"', query_content)[:3]
-                    if not initial_queries:
-                        initial_queries = ["Information about " + user_message]
+                    # Fallback: robust extraction from raw text
+                    initial_queries = self._extract_queries_from_llm_response(
+                        query_content, user_message, max_queries=3
+                    )
 
                 # Display the queries to the user
                 await self.emit_message(f"### Initial Follow-up Research Queries\n\n")
@@ -9920,17 +10092,20 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
                     "role": "system",
                     "content": f"""You are a post-grad research assistant generating effective search queries.
     The user has submitted a research query: "{user_message}".
-	Based on the user's input, generate 8 initial search queries to begin research and help us delineate the research topic.
+    Based on the user's input, generate 8 initial search queries to begin research and help us delineate the research topic.
     Half of the queries should be broad, aimed at identifying and defining the main topic and returning core characteristic information about it.
-	The other half should be more specific, designed to find information to help expand on known base details of the user's query.
+    The other half should be more specific, designed to find information to help expand on known base details of the user's query.
     Use quotes sparingly and as a last resort. Never use multiple sets of quotes in the same query.
-	
-	Format your response as a valid JSON object with the following structure:
-	{{"queries": [
-	  "search query 1", 
-	  "search query 2",
-	  "search query 3..."
-	]}}""",
+
+    Respond ONLY with a valid JSON object and nothing else (no prose, no code fences, no metadata, no model names, no IDs).
+    JSON schema:
+    {{"queries": [
+      "search query 1",
+      "search query 2",
+      "search query 3..."
+    ]}}
+    If unsure, return a minimal valid JSON with one query derived from the user message.
+    Start the response with '{{' and end with '}}'.""",
                 }
 
                 initial_query_messages = [
@@ -9946,6 +10121,7 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
                     self.get_research_model(),
                     initial_query_messages,
                     temperature=self.valves.TEMPERATURE,
+                    user_facing=True,
                 )
                 query_content = query_response["choices"][0]["message"]["content"]
 
@@ -9955,15 +10131,30 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
                         query_content.find("{") : query_content.rfind("}") + 1
                     ]
                     query_data = json.loads(query_json_str)
-                    initial_queries = query_data.get("queries", [])
+                    raw_queries = query_data.get("queries", [])
+
+                    # Normalize different possible formats to a list of strings
+                    initial_queries: List[str] = []
+                    if isinstance(raw_queries, list):
+                        for q in raw_queries:
+                            if isinstance(q, str):
+                                initial_queries.append(q)
+                            elif isinstance(q, dict):
+                                candidate = q.get("query")
+                                if isinstance(candidate, str):
+                                    initial_queries.append(candidate)
+
+                    # If we didn't get any usable queries from JSON, trigger fallback
+                    if not initial_queries or any(
+                        self._looks_like_metadata_query(q) for q in initial_queries
+                    ):
+                        raise ValueError("No valid queries in JSON response")
                 except (json.JSONDecodeError, ValueError) as e:
                     logger.error(f"Error parsing query JSON: {e}")
-                    # Fallback: extract queries using regex if JSON parsing fails
-                    import re
-
-                    initial_queries = re.findall(r'"([^"]+)"', query_content)[:3]
-                    if not initial_queries:
-                        initial_queries = ["Information about " + user_message]
+                    # Fallback: robust extraction from raw text
+                    initial_queries = self._extract_queries_from_llm_response(
+                        query_content, user_message, max_queries=3
+                    )
 
                 # Display the queries to the user
                 await self.emit_message(f"### Initial Research Queries\n\n")
@@ -11079,6 +11270,7 @@ Format your response as a valid JSON object with the following structure:
                 [intro_prompt, intro_message],
                 stream=False,
                 temperature=self.valves.SYNTHESIS_TEMPERATURE * 0.83,
+                user_facing=True,
             )
 
             if (
@@ -11177,6 +11369,7 @@ Format your response as a valid JSON object with the following structure:
                 [concl_prompt, concl_message],
                 stream=False,
                 temperature=self.valves.SYNTHESIS_TEMPERATURE,
+                user_facing=True,
             )
 
             if (
