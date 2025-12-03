@@ -1,6 +1,6 @@
 # Original work by GitHub user atineiatte (2024)
 # Modifications by Seweryn Sitarski (2025)
-# Version: 0.2.1
+# Version: 0.2.2
 
 # Licensed under the Apache License, Version 2.0 (the "License");
 # You may not use this file except in compliance with the License.
@@ -5956,9 +5956,14 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
         try:
             decoded = body_bytes.decode("utf-8", "replace")
 
-            # Handle streaming-style "data: {...}" payloads by concatenating deltas
+            # Handle streaming-style "data: {...}" payloads by concatenating deltas.
+            # For reasoning-capable models we:
+            #   - accumulate visible answer from `content`
+            #   - accumulate internal reasoning from `reasoning_content` separately
+            #   - only surface `content` to callers (falling back to reasoning if no content at all)
             if decoded.strip().startswith("data:") or "data:" in decoded:
-                content_chunks = []
+                content_chunks: List[str] = []
+                reasoning_chunks: List[str] = []
                 finish_reason = None
                 try:
                     for line in decoded.splitlines():
@@ -5978,19 +5983,34 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
                             continue
 
                         delta = choices[0].get("delta") or choices[0].get("message") or {}
-                        piece = delta.get("content") or delta.get("reasoning_content")
-                        if piece:
-                            content_chunks.append(piece)
+
+                        content_piece = delta.get("content")
+                        if content_piece:
+                            content_chunks.append(str(content_piece))
+
+                        reasoning_piece = delta.get("reasoning_content")
+                        if reasoning_piece:
+                            reasoning_chunks.append(str(reasoning_piece))
 
                         fr = choices[0].get("finish_reason")
                         if fr:
                             finish_reason = fr
 
-                    if content_chunks:
+                    if content_chunks or reasoning_chunks:
+                        visible_text = "".join(content_chunks) if content_chunks else "".join(
+                            reasoning_chunks
+                        )
+                        message: Dict[str, Any] = {"content": visible_text}
+
+                        # Preserve full reasoning for potential debugging without exposing
+                        # it to normal flows that only read `message['content']`.
+                        if reasoning_chunks:
+                            message["reasoning_content"] = "".join(reasoning_chunks)
+
                         return {
                             "choices": [
                                 {
-                                    "message": {"content": "".join(content_chunks)},
+                                    "message": message,
                                     "finish_reason": finish_reason,
                                 }
                             ]
