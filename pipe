@@ -1,6 +1,6 @@
 # Original work by GitHub user atineiatte (2024)
 # Modifications by Seweryn Sitarski (2025)
-# Version: 0.2.0
+# Version: 0.2.1
 
 # Licensed under the Apache License, Version 2.0 (the "License");
 # You may not use this file except in compliance with the License.
@@ -21,6 +21,7 @@ import time
 import asyncio
 import re
 import random
+import contextvars
 import numpy as np
 import aiohttp
 import concurrent.futures
@@ -203,6 +204,9 @@ class ResearchStateManager:
 
 
 class Pipe:
+    _active_conversations: Set[str] = set()
+    _conversation_lock: Optional[asyncio.Lock] = None
+
     __current_event_emitter__: Callable[[dict], Awaitable[None]]
     __current_event_call__: Callable[[dict], Awaitable[Any]]
     __user__: User
@@ -441,6 +445,12 @@ class Pipe:
             ge=1,
             le=50,
         )
+        PARALLEL_SESSIONS: int = Field(
+            default=2,
+            description="Maximum number of concurrent research sessions",
+            ge=1,
+            le=10,
+        )
         DEBUG_LLM: bool = Field(
             default=False,
             description="Enable detailed logging of LLM requests/responses (truncated for safety)",
@@ -463,9 +473,15 @@ class Pipe:
         self.embedding_dim: Optional[int] = None
 
         self.research_date = datetime.now().strftime("%Y-%m-%d")
-        self.executor = concurrent.futures.ThreadPoolExecutor(
-            max_workers=self.valves.THREAD_WORKERS
+        self._conversation_ctx: contextvars.ContextVar[str] = contextvars.ContextVar(
+            "conversation_id", default=None
         )
+        self._conversation_executors: Dict[
+            str, concurrent.futures.ThreadPoolExecutor
+        ] = {}
+        # Lazily instantiate a shared lock so multiple conversations can coordinate access
+        if Pipe._conversation_lock is None:
+            Pipe._conversation_lock = asyncio.Lock()
 
     async def initialize_research_state(
         self,
@@ -599,24 +615,149 @@ class Pipe:
 
         return memory_stats
 
+    def _set_conversation_context(self, conversation_id: str):
+        """Bind the current task to a conversation ID"""
+        self.conversation_id = conversation_id
+        try:
+            self._conversation_ctx.set(conversation_id)
+        except Exception:
+            # ContextVar.set shouldn't fail, but keep a fallback
+            pass
+
+    def _get_current_conversation_id(self) -> str:
+        """Retrieve the conversation ID bound to this task"""
+        conversation_id = self._conversation_ctx.get(None)
+        if conversation_id:
+            return conversation_id
+        if self.conversation_id:
+            return self.conversation_id
+        # Generate a temporary ID if we don't have one yet
+        temp_id = f"temp_{hash(str(self.__user__.id))}"
+        self._set_conversation_context(temp_id)
+        return temp_id
+
     def get_state(self):
         """Get the current conversation state"""
-        if not self.conversation_id:
-            # Generate a temporary ID if we don't have one yet
-            self.conversation_id = f"temp_{hash(str(self.__user__.id))}"
-        return self.state_manager.get_state(self.conversation_id)
+        conversation_id = self._get_current_conversation_id()
+        return self.state_manager.get_state(conversation_id)
 
     def update_state(self, key, value):
         """Update a specific state value"""
-        self.state_manager.update_state(self.conversation_id, key, value)
+        conversation_id = self._get_current_conversation_id()
+        self.state_manager.update_state(conversation_id, key, value)
 
-    def reset_state(self):
+    def reset_state(self, conversation_id: Optional[str] = None):
         """Reset the state for the current conversation"""
-        if self.conversation_id:
-            self.state_manager.reset_state(self.conversation_id)
+        conv_id = conversation_id or self._get_current_conversation_id()
+        if conv_id:
+            self.state_manager.reset_state(conv_id)
             self.trajectory_accumulator = None
             self.is_pdf_content = False
-            logger.info(f"Full state reset for conversation: {self.conversation_id}")
+            logger.info(f"Full state reset for conversation: {conv_id}")
+
+    def _max_conversations(self) -> int:
+        """Number of allowed concurrent sessions"""
+        try:
+            limit = int(getattr(self.valves, "PARALLEL_SESSIONS", 2))
+            return max(1, min(limit, 10))
+        except Exception:
+            return 2
+
+    def _active_count(self) -> Tuple[int, int]:
+        """Current active count and limit"""
+        return len(Pipe._active_conversations), self._max_conversations()
+
+    async def _acquire_conversation_slot(self, conversation_id: str) -> bool:
+        """Ensure we respect the maximum number of concurrent conversations"""
+        wait_notified = False
+        start_time = time.time()
+
+        while True:
+            acquired = False
+            limit = self._max_conversations()
+            async with Pipe._conversation_lock:
+                if (
+                    conversation_id in Pipe._active_conversations
+                    or len(Pipe._active_conversations) < limit
+                ):
+                    Pipe._active_conversations.add(conversation_id)
+                    logger.info(
+                        f"Conversation {conversation_id} acquired slot "
+                        f"({len(Pipe._active_conversations)}/{limit})"
+                    )
+                    acquired = True
+
+            if acquired:
+                if wait_notified:
+                    await self.emit_message(
+                        f"*Wolny slot dostępny – rozpoczynamy badanie. "
+                        f"Aktywne sesje: {len(Pipe._active_conversations)}/{limit}*\n"
+                    )
+                return True
+
+            if not wait_notified:
+                active, limit = self._active_count()
+                await self.emit_status(
+                    "info",
+                    f"Trwa maksymalna liczba badań ({active}/{limit}). Twoje zapytanie czeka na wolny slot.",
+                    False,
+                )
+                await self.emit_message(
+                    f"*Dodano do kolejki. Rozpoczniemy badanie, gdy zwolni się miejsce. "
+                    f"Aktualnie aktywne: {active}/{limit}*\n"
+                )
+                wait_notified = True
+
+            if time.time() - start_time > 300:
+                await self.emit_message(
+                    "*Nie udało się uruchomić badania w rozsądnym czasie. Spróbuj ponownie później.*\n"
+                )
+                return False
+
+            await asyncio.sleep(1.5)
+
+    async def _release_conversation_slot(self, conversation_id: str):
+        """Release the conversation slot after work finishes"""
+        limit = self._max_conversations()
+        async with Pipe._conversation_lock:
+            if conversation_id in Pipe._active_conversations:
+                Pipe._active_conversations.discard(conversation_id)
+                logger.info(
+                    f"Conversation {conversation_id} released slot "
+                    f"({len(Pipe._active_conversations)}/{limit})"
+                )
+
+    def _ensure_executor(self, conversation_id: str):
+        """Get or create an executor dedicated to this conversation"""
+        executor = self._conversation_executors.get(conversation_id)
+        if executor is None:
+            executor = concurrent.futures.ThreadPoolExecutor(
+                max_workers=self.valves.THREAD_WORKERS
+            )
+            self._conversation_executors[conversation_id] = executor
+        return executor
+
+    async def _cleanup_conversation_resources(self, conversation_id: str):
+        """Tear down per-conversation resources and caches"""
+        try:
+            executor = self._conversation_executors.pop(conversation_id, None)
+            if executor:
+                executor.shutdown(wait=False, cancel_futures=True)
+        except Exception as e:
+            logger.warning(f"Error shutting down executor for {conversation_id}: {e}")
+
+        try:
+            self.state_manager.reset_state(conversation_id)
+        except Exception as e:
+            logger.warning(f"Error resetting state for {conversation_id}: {e}")
+
+        await self._release_conversation_slot(conversation_id)
+
+        # Clear task-local binding so a new conversation can bind cleanly
+        try:
+            self._conversation_ctx.set(None)
+        except Exception:
+            pass
 
     def pipes(self) -> list[dict[str, str]]:
         return [{"id": f"{name}", "name": f"{name}"}]
@@ -4211,8 +4352,9 @@ class Pipe:
 
                 # Execute in thread pool
                 loop = asyncio.get_event_loop()
+                executor = self._ensure_executor(self._get_current_conversation_id())
                 pdf_extract_task = loop.run_in_executor(
-                    self.executor, extract_with_pypdf
+                    executor, extract_with_pypdf
                 )
                 full_text = await pdf_extract_task
 
@@ -4265,8 +4407,9 @@ class Pipe:
 
                 # Execute in thread pool
                 loop = asyncio.get_event_loop()
+                executor = self._ensure_executor(self._get_current_conversation_id())
                 pdf_extract_task = loop.run_in_executor(
-                    self.executor, extract_with_pdfplumber
+                    executor, extract_with_pdfplumber
                 )
                 full_text = await pdf_extract_task
 
@@ -9680,668 +9823,110 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
         # First message ID in the conversation serves as our conversation identifier
         first_message = messages[0] if messages else {}
         conversation_id = f"{__user__['id']}_{first_message.get('id', 'default')}"
-        self.conversation_id = conversation_id
+        self._set_conversation_context(conversation_id)
 
-        # Check if this appears to be a completely new conversation
-        state = self.get_state()
-        waiting_for_outline_feedback = state.get("waiting_for_outline_feedback", False)
-        if (
-            len(messages) <= 2 and not waiting_for_outline_feedback
-        ):  # Check we're not waiting for feedback
-            logger.info(f"New conversation detected with ID: {conversation_id}")
-            self.reset_state()  # Reset all state for this conversation
-
-        # Initialize master source table if not exists
-        state = self.get_state()
-        if "master_source_table" not in state:
-            self.update_state("master_source_table", {})
-
-        # Initialize other critical state variables if missing
-        if "memory_stats" not in state:
-            self.update_state(
-                "memory_stats",
-                {
-                    "results_tokens": 0,
-                    "section_tokens": {},
-                    "synthesis_tokens": 0,
-                    "total_tokens": 0,
-                },
-            )
-
-        if "url_selected_count" not in state:
-            self.update_state("url_selected_count", {})
-
-        if "url_token_counts" not in state:
-            self.update_state("url_token_counts", {})
-
-        # If the pipe is disabled or it's not a default task, return
-        if not self.valves.ENABLED or (__task__ and __task__ != TASKS.DEFAULT):
+        # Respect max concurrent conversations
+        slot_acquired = await self._acquire_conversation_slot(conversation_id)
+        if not slot_acquired:
             return ""
 
-        # Get user query from the latest message
-        user_message = messages[-1].get("content", "").strip()
-        if not user_message:
-            return ""
+        # Ensure per-conversation executor exists
+        self._ensure_executor(conversation_id)
 
-        # Set research date
-        from datetime import datetime
+        research_finished = False
+        cleanup_done = False
 
-        self.research_date = datetime.now().strftime("%Y-%m-%d")
+        try:
 
-        # Get state for this conversation
-        state = self.get_state()
+            # Check if this appears to be a completely new conversation
+            state = self.get_state()
+            waiting_for_outline_feedback = state.get("waiting_for_outline_feedback", False)
+            if (
+                len(messages) <= 2 and not waiting_for_outline_feedback
+            ):  # Check we're not waiting for feedback
+                logger.info(f"New conversation detected with ID: {conversation_id}")
+                self.reset_state(conversation_id)  # Reset all state for this conversation
 
-        # Check waiting flag directly in state
-        if state.get("waiting_for_outline_feedback", False):
-            # We're expecting outline feedback - capture the core outline data
-            # to ensure it's not lost in state transitions
-            feedback_data = state.get("outline_feedback_data", {})
-            if feedback_data:
-                # Process the user's feedback
-                self.update_state("waiting_for_outline_feedback", False)
-                feedback_result = await self.process_outline_feedback_continuation(
-                    user_message
-                )
+            # Initialize master source table if not exists
+            state = self.get_state()
+            if "master_source_table" not in state:
+                self.update_state("master_source_table", {})
 
-                # Get the research state parameters directly from feedback data
-                original_query = feedback_data.get("original_query", "")
-                outline_items = feedback_data.get("outline_items", [])
-                flat_items = feedback_data.get("flat_items", [])
-
-                # Retrieve all_topics and outline_embedding if we have them
-                all_topics = []
-                for topic_item in outline_items:
-                    all_topics.append(topic_item["topic"])
-                    all_topics.extend(topic_item.get("subtopics", []))
-
-                # Update outline embedding based on all_topics
-                outline_text = " ".join(all_topics)
-                outline_embedding = await self.get_embedding(outline_text)
-
-                # Continue the research process from the outline feedback
-                research_outline, all_topics, outline_embedding = (
-                    await self.continue_research_after_feedback(
-                        feedback_result,
-                        original_query,
-                        outline_items,
-                        all_topics,
-                        outline_embedding,
-                    )
-                )
-
-                # Now continue with the main research process using the updated research state
-                user_message = original_query
-
-                # Initialize research state consistently
-                await self.initialize_research_state(
-                    user_message,
-                    research_outline,
-                    all_topics,
-                    outline_embedding,
-                )
-
-                # Update token counts
-                await self.update_token_counts()
-            else:
-                # If we're supposedly waiting for feedback but have no data,
-                # treat as normal query (recover from error state)
-                self.update_state("waiting_for_outline_feedback", False)
-                logger.warning("Waiting for outline feedback but no data available")
-
-        # Check if this is a follow-up query
-        is_follow_up = await self.is_follow_up_query(messages)
-        self.update_state("follow_up_mode", is_follow_up)
-
-        # Get summary embedding if this is a follow-up
-        summary_embedding = None
-        if is_follow_up:
-            prev_comprehensive_summary = state.get("prev_comprehensive_summary", "")
-            if prev_comprehensive_summary:
-                try:
-                    await self.emit_status(
-                        "info", "Processing follow-up query...", False
-                    )
-                    summary_embedding = await self.get_embedding(
-                        prev_comprehensive_summary
-                    )
-                    await self.emit_message("## Deep Research Mode: Follow-up\n\n")
-                    await self.emit_message(
-                        "I'll continue researching based on your follow-up query while considering our previous findings.\n\n"
-                    )
-                except Exception as e:
-                    logger.error(f"Error getting summary embedding: {e}")
-                    # Continue without the summary embedding if there's an error
-                    is_follow_up = False
-                    self.update_state("follow_up_mode", False)
-                    await self.emit_message("## Deep Research Mode: Activated\n\n")
-                    await self.emit_message(
-                        "I'll search for comprehensive information about your query. This might take a moment...\n\n"
-                    )
-            else:
-                is_follow_up = False
-                self.update_state("follow_up_mode", False)
-        else:
-            await self.emit_status("info", "Starting deep research...", False)
-            await self.emit_message("## Deep Research Mode: Activated\n\n")
-            await self.emit_message(
-                "I'll search for comprehensive information about your query. This might take a moment...\n\n"
-            )
-
-        # Check if we have research state from previous feedback
-        research_state = state.get("research_state")
-        if research_state:
-            # Use the existing research state from feedback
-            research_outline = research_state.get("research_outline", [])
-            all_topics = research_state.get("all_topics", [])
-            outline_embedding = research_state.get("outline_embedding")
-            user_message = research_state.get("user_message", user_message)
-
-            await self.emit_status(
-                "info", "Continuing research with updated outline...", False
-            )
-
-            # Skip to research cycles
-            initial_results = []  # We'll regenerate search results
-
-        else:
-            # For follow-up queries, we need to generate a new research outline based on the previous summary
-            if is_follow_up:
-                outline_embedding = await self.get_embedding(
-                    user_message
-                )  # Create initial placeholder
-                # Step 1: Generate initial search queries for follow-up considering previous summary
-                await self.emit_status(
-                    "info", "Generating initial search queries for follow-up...", False
-                )
-
-                initial_query_prompt = {
-                    "role": "system",
-                    "content": """You are a post-grad research assistant generating effective search queries for continued research based on an existing report.
-    Based on the user's follow-up question and the previous research summary, generate 6 initial search queries.
-    Each query should be specific, use relevant keywords, and be designed to find new information that builds on the previous research towards the new query.
-    Use quotes sparingly and as a last resort. Never use multiple sets of quotes in the same query.
-
-    Respond ONLY with a valid JSON object and nothing else (no prose, no code fences, no metadata, no model names, no IDs).
-    JSON schema:
-    {"queries": [
-      "search query 1",
-      "search query 2",
-      "search query 3"
-    ]}
-    If unsure, return a minimal valid JSON with one query derived from the user message.
-    Start the response with '{' and end with '}'.""",
-                }
-
-                initial_query_messages = [
-                    initial_query_prompt,
+            # Initialize other critical state variables if missing
+            if "memory_stats" not in state:
+                self.update_state(
+                    "memory_stats",
                     {
-                        "role": "user",
-                        "content": f"Follow-up question: {user_message}\n\nPrevious research summary:\n{state.get('prev_comprehensive_summary', '')}...\n\nGenerate initial search queries for the follow-up question that build on the previous research.",
+                        "results_tokens": 0,
+                        "section_tokens": {},
+                        "synthesis_tokens": 0,
+                        "total_tokens": 0,
                     },
-                ]
-
-                # Get initial search queries
-                query_response = await self.generate_completion(
-                    self.get_research_model(),
-                    initial_query_messages,
-                    temperature=self.valves.TEMPERATURE,
-                    user_facing=True,
                 )
-                query_content = query_response["choices"][0]["message"]["content"]
 
-                # Extract JSON from response
-                try:
-                    query_json_str = query_content[
-                        query_content.find("{") : query_content.rfind("}") + 1
-                    ]
-                    query_data = json.loads(query_json_str)
-                    raw_queries = query_data.get("queries", [])
+            if "url_selected_count" not in state:
+                self.update_state("url_selected_count", {})
 
-                    # Normalize different possible formats to a list of strings
-                    initial_queries: List[str] = []
-                    if isinstance(raw_queries, list):
-                        for q in raw_queries:
-                            if isinstance(q, str):
-                                initial_queries.append(q)
-                            elif isinstance(q, dict):
-                                candidate = q.get("query")
-                                if isinstance(candidate, str):
-                                    initial_queries.append(candidate)
+            if "url_token_counts" not in state:
+                self.update_state("url_token_counts", {})
 
-                    # If we didn't get any usable queries from JSON, trigger fallback
-                    if not initial_queries or any(
-                        self._looks_like_metadata_query(q) for q in initial_queries
-                    ):
-                        raise ValueError("No valid queries in JSON response")
-                except (json.JSONDecodeError, ValueError) as e:
-                    logger.error(f"Error parsing query JSON: {e}")
-                    # Fallback: robust extraction from raw text
-                    initial_queries = self._extract_queries_from_llm_response(
-                        query_content, user_message, max_queries=3
+            # If the pipe is disabled or it's not a default task, return
+            if not self.valves.ENABLED or (__task__ and __task__ != TASKS.DEFAULT):
+                return ""
+
+            # Get user query from the latest message
+            user_message = messages[-1].get("content", "").strip()
+            if not user_message:
+                return ""
+
+            # Set research date
+            from datetime import datetime
+
+            self.research_date = datetime.now().strftime("%Y-%m-%d")
+
+            # Get state for this conversation
+            state = self.get_state()
+
+            # Check waiting flag directly in state
+            if state.get("waiting_for_outline_feedback", False):
+                # We're expecting outline feedback - capture the core outline data
+                # to ensure it's not lost in state transitions
+                feedback_data = state.get("outline_feedback_data", {})
+                if feedback_data:
+                    # Process the user's feedback
+                    self.update_state("waiting_for_outline_feedback", False)
+                    feedback_result = await self.process_outline_feedback_continuation(
+                        user_message
                     )
 
-                # Display the queries to the user
-                await self.emit_message(f"### Initial Follow-up Research Queries\n\n")
-                for i, query in enumerate(initial_queries):
-                    await self.emit_message(f"**Query {i+1}**: {query}\n\n")
+                    # Get the research state parameters directly from feedback data
+                    original_query = feedback_data.get("original_query", "")
+                    outline_items = feedback_data.get("outline_items", [])
+                    flat_items = feedback_data.get("flat_items", [])
 
-                # Execute initial searches with the follow-up queries
-                # Use summary embedding for context relevance
-                initial_results = []
-                initial_seen_urls = set()  # Track URLs seen during initial research
+                    # Retrieve all_topics and outline_embedding if we have them
+                    all_topics = []
+                    for topic_item in outline_items:
+                        all_topics.append(topic_item["topic"])
+                        all_topics.extend(topic_item.get("subtopics", []))
 
-                for query in initial_queries:
-                    # Get query embedding for content comparison
-                    try:
-                        await self.emit_status(
-                            "info", f"Getting embedding for query: {query}", False
+                    # Update outline embedding based on all_topics
+                    outline_text = " ".join(all_topics)
+                    outline_embedding = await self.get_embedding(outline_text)
+
+                    # Continue the research process from the outline feedback
+                    research_outline, all_topics, outline_embedding = (
+                        await self.continue_research_after_feedback(
+                            feedback_result,
+                            original_query,
+                            outline_items,
+                            all_topics,
+                            outline_embedding,
                         )
-                        query_embedding = await self.get_embedding(query)
-                        if not query_embedding:
-                            # If we can't get an embedding from the model, create a default one
-                            logger.warning(
-                                f"Failed to get embedding for '{query}', using default"
-                            )
-                            fallback_dim = self.embedding_dim or 384
-                            query_embedding = [0.0] * fallback_dim
-                    except Exception as e:
-                        logger.error(f"Error getting embedding: {e}")
-                        fallback_dim = self.embedding_dim or 384
-                        query_embedding = [0.0] * fallback_dim
-
-                    # Process the query and get results
-                    results = await self.process_query(
-                        query,
-                        query_embedding,
-                        outline_embedding,
-                        None,
-                        summary_embedding,
                     )
 
-                    # Filter out any URLs we've already seen in initial research
-                    filtered_results = []
-                    for result in results:
-                        url = result.get("url", "")
-                        if url and url not in initial_seen_urls:
-                            filtered_results.append(result)
-                            initial_seen_urls.add(url)  # Mark this URL as seen
-                        else:
-                            logger.info(
-                                f"Filtering out repeated URL in initial research: {url}"
-                            )
-
-                    # If we filtered out all results, log it
-                    if results and not filtered_results:
-                        logger.info(
-                            f"All {len(results)} results filtered due to URL repetition in initial research"
-                        )
-                        # If all results were filtered, try to get at least one result by using the first one
-                        if results:
-                            filtered_results.append(results[0])
-                            logger.info(
-                                f"Added back one result to ensure minimal research data"
-                            )
-
-                    # Add non-repeated results to our collection
-                    initial_results.extend(filtered_results)
-
-                # Generate research outline that incorporates previous findings and new follow-up
-                await self.emit_status(
-                    "info", "Generating research outline for follow-up...", False
-                )
-
-                outline_prompt = {
-                    "role": "system",
-                    "content": """You are a post-grad research assistant creating a structured research outline.
-	Based on the user's follow-up question, previous research summary, and new search results, create a comprehensive outline 
-	that builds on the previous research while addressing the new aspects from the follow-up question.
-	
-	The outline should:
-	1. Include relevant topics from the previous research that provide context
-	2. Add new topics that specifically address the follow-up question
-	3. Be organized in a hierarchical structure with main topics and subtopics
-	4. Focus on aspects that weren't covered in depth in the previous research
-	
-	Format your response as a valid JSON object with the following structure:
-	{"outline": [
-	  {"topic": "Main topic 1", "subtopics": ["Subtopic 1.1", "Subtopic 1.2"]},
-	  {"topic": "Main topic 2", "subtopics": ["Subtopic 2.1", "Subtopic 2.2"]}
-	]}""",
-                }
-
-                # Build context from initial search results and previous summary
-                outline_context = "### Previous Research Summary:\n\n"
-                outline_context += (
-                    f"{state.get('prev_comprehensive_summary', '')}...\n\n"
-                )
-
-                outline_context += "### New Search Results:\n\n"
-                for i, result in enumerate(initial_results):
-                    outline_context += f"Result {i+1} (Query: '{result['query']}')\n"
-                    outline_context += f"Title: {result['title']}\n"
-                    outline_context += f"Content: {result['content']}...\n\n"
-
-                outline_messages = [
-                    outline_prompt,
-                    {
-                        "role": "user",
-                        "content": f"Follow-up question: {user_message}\n\n{outline_context}\n\nGenerate a comprehensive research outline that builds on previous research while addressing the follow-up question.",
-                    },
-                ]
-
-                # Generate the research outline
-                outline_response = await self.generate_completion(
-                    self.get_research_model(), outline_messages
-                )
-                outline_content = outline_response["choices"][0]["message"]["content"]
-
-                # Extract JSON from response
-                try:
-                    outline_json_str = outline_content[
-                        outline_content.find("{") : outline_content.rfind("}") + 1
-                    ]
-                    outline_data = json.loads(outline_json_str)
-                    research_outline = outline_data.get("outline", [])
-                except (json.JSONDecodeError, ValueError) as e:
-                    logger.error(f"Error parsing outline JSON: {e}")
-                    # Fallback: create a simple outline if JSON parsing fails
-                    research_outline = [
-                        {
-                            "topic": "Follow-up Information",
-                            "subtopics": ["Key Aspects", "New Developments"],
-                        },
-                        {
-                            "topic": "Extended Analysis",
-                            "subtopics": ["Additional Details", "Further Examples"],
-                        },
-                    ]
-
-                # Create a flat list of all topics for tracking
-                all_topics = []
-                for topic_item in research_outline:
-                    all_topics.append(topic_item["topic"])
-                    all_topics.extend(topic_item.get("subtopics", []))
-
-                # Create outline embedding
-                outline_text = " ".join(all_topics)
-                outline_embedding = await self.get_embedding(outline_text)
-
-                # Initialize research dimensions
-                await self.initialize_research_dimensions(all_topics, user_message)
-
-                # Display the outline to the user
-                outline_text = "### Research Outline for Follow-up\n\n"
-                for topic in research_outline:
-                    outline_text += f"**{topic['topic']}**\n"
-                    for subtopic in topic.get("subtopics", []):
-                        outline_text += f"- {subtopic}\n"
-                    outline_text += "\n"
-
-                await self.emit_message(outline_text)
-                await self.emit_message(
-                    "\n*Continuing with research based on this outline and previous findings...*\n\n"
-                )
-
-            else:
-                # Regular new query - generate initial search queries
-                await self.emit_status(
-                    "info", "Generating initial search queries...", False
-                )
-
-                initial_query_prompt = {
-                    "role": "system",
-                    "content": f"""You are a post-grad research assistant generating effective search queries.
-    The user has submitted a research query: "{user_message}".
-    Based on the user's input, generate 8 initial search queries to begin research and help us delineate the research topic.
-    Half of the queries should be broad, aimed at identifying and defining the main topic and returning core characteristic information about it.
-    The other half should be more specific, designed to find information to help expand on known base details of the user's query.
-    Use quotes sparingly and as a last resort. Never use multiple sets of quotes in the same query.
-
-    Respond ONLY with a valid JSON object and nothing else (no prose, no code fences, no metadata, no model names, no IDs).
-    JSON schema:
-    {{"queries": [
-      "search query 1",
-      "search query 2",
-      "search query 3..."
-    ]}}
-    If unsure, return a minimal valid JSON with one query derived from the user message.
-    Start the response with '{{' and end with '}}'.""",
-                }
-
-                initial_query_messages = [
-                    initial_query_prompt,
-                    {
-                        "role": "user",
-                        "content": f"Generate initial search queries for this user query: {user_message}",
-                    },
-                ]
-
-                # Get initial search queries
-                query_response = await self.generate_completion(
-                    self.get_research_model(),
-                    initial_query_messages,
-                    temperature=self.valves.TEMPERATURE,
-                    user_facing=True,
-                )
-                query_content = query_response["choices"][0]["message"]["content"]
-
-                # Extract JSON from response
-                try:
-                    query_json_str = query_content[
-                        query_content.find("{") : query_content.rfind("}") + 1
-                    ]
-                    query_data = json.loads(query_json_str)
-                    raw_queries = query_data.get("queries", [])
-
-                    # Normalize different possible formats to a list of strings
-                    initial_queries: List[str] = []
-                    if isinstance(raw_queries, list):
-                        for q in raw_queries:
-                            if isinstance(q, str):
-                                initial_queries.append(q)
-                            elif isinstance(q, dict):
-                                candidate = q.get("query")
-                                if isinstance(candidate, str):
-                                    initial_queries.append(candidate)
-
-                    # If we didn't get any usable queries from JSON, trigger fallback
-                    if not initial_queries or any(
-                        self._looks_like_metadata_query(q) for q in initial_queries
-                    ):
-                        raise ValueError("No valid queries in JSON response")
-                except (json.JSONDecodeError, ValueError) as e:
-                    logger.error(f"Error parsing query JSON: {e}")
-                    # Fallback: robust extraction from raw text
-                    initial_queries = self._extract_queries_from_llm_response(
-                        query_content, user_message, max_queries=3
-                    )
-
-                # Display the queries to the user
-                await self.emit_message(f"### Initial Research Queries\n\n")
-                for i, query in enumerate(initial_queries):
-                    await self.emit_message(f"**Query {i+1}**: {query}\n\n")
-
-                # Step 2: Execute initial searches and collect results
-                # Get outline embedding (placeholder - will be updated after outline is created)
-                outline_embedding = await self.get_embedding(user_message)
-
-                initial_results = []
-                for query in initial_queries:
-                    # Get query embedding for content comparison
-                    try:
-                        await self.emit_status(
-                            "info", f"Getting embedding for query: {query}", False
-                        )
-                        query_embedding = await self.get_embedding(query)
-                        if not query_embedding:
-                            # If we can't get an embedding from the model, create a default one
-                            logger.warning(
-                                f"Failed to get embedding for '{query}', using default"
-                            )
-                            fallback_dim = self.embedding_dim or 384
-                            query_embedding = [0.0] * fallback_dim
-                    except Exception as e:
-                        logger.error(f"Error getting embedding: {e}")
-                        fallback_dim = self.embedding_dim or 384
-                        query_embedding = [0.0] * fallback_dim
-
-                    # Process the query and get results
-                    results = await self.process_query(
-                        query,
-                        query_embedding,
-                        outline_embedding,
-                        None,
-                        summary_embedding,
-                    )
-
-                    # Add successful results to our collection
-                    initial_results.extend(results)
-
-                # Check if we got any useful results
-                useful_results = [
-                    r for r in initial_results if len(r.get("content", "")) > 200
-                ]
-
-                # If we didn't get any useful results, create a minimal result to continue
-                if not useful_results:
-                    await self.emit_message(
-                        f"*Unable to find initial search results. Creating research outline based on the query alone.*\n\n"
-                    )
-                    initial_results = [
-                        {
-                            "title": f"Information about {user_message}",
-                            "url": "",
-                            "content": f"This is a placeholder for research about {user_message}. The search failed to return usable results.",
-                            "query": user_message,
-                        }
-                    ]
-                else:
-                    # Log the successful results
-                    logger.info(
-                        f"Found {len(useful_results)} useful results from initial queries"
-                    )
-
-                # Step 3: Generate research outline based on user query AND initial results
-                await self.emit_status(
-                    "info",
-                    "Analyzing initial results and generating research outline...",
-                    False,
-                )
-
-                outline_prompt = {
-                    "role": "system",
-                    "content": f"""You are a post-graduate academic scholar tasked with creating a structured research outline.
-	Based on the user's query and the initial search results, create a comprehensive conceptual outline of additional information 
-	needed to completely and thoroughly address the user's original query: "{user_message}".
-	
-	The outline must:
-	1. Break down the query into key concepts that need to be researched and key details about important figures, details, methods, etc.
-	2. Be organized in a hierarchical structure, with main topics directly relevant to addressing the query, and subtopics to flesh out main topics.
-	3. Include topics discovered in the initial search results relevant to addressing the user's input, while ignoring overly-specific or unrelated topics.
-
-    The outline MUST NOT:
-    1. Delve into philosophical or theoretical approaches, unless clearly appropriate to the subject or explicitly solicited by the user.
-    2. Include generic topics or subtopics, i.e. "considering complexities" or "understanding the question".
-    3. Reflect your own opinions, bias, notions, priorities, or other non-academic impressions of the area of research.
-
-    Your outline should conceptually take up the entire space between an introduction and conclusion, filling in the entirety of the research volume.
-    Do NOT allow rendering artifacts, web site UI features, HTML/CSS/underlying website build language, or any other irrelevant text to distract you from your goal.
-    Don't add an appendix topic, nor an explicit introduction or conclusion topic. ONLY include the outline in your response.
-	
-	Format your response as a valid JSON object with the following structure:
-	{{"outline": [
-	  {{"topic": "Main topic 1", "subtopics": ["Subtopic 1.1", "Subtopic 1.2"]}},
-	  {{"topic": "Main topic 2", "subtopics": ["Subtopic 2.1", "Subtopic 2.2"]}}
-	]}}""",
-                }
-
-                # Build context from initial search results
-                outline_context = "### Initial Search Results:\n\n"
-                for i, result in enumerate(initial_results):
-                    outline_context += f"Result {i+1} (Query: '{result['query']}')\n"
-                    outline_context += f"Title: {result['title']}\n"
-                    outline_context += f"Content: {result['content']}...\n\n"
-
-                outline_messages = [
-                    outline_prompt,
-                    {
-                        "role": "user",
-                        "content": f"Original query: {user_message}\n\n{outline_context}\n\nGenerate a structured research outline following the instructions in the system prompt. ",
-                    },
-                ]
-
-                # Generate the research outline
-                outline_response = await self.generate_completion(
-                    self.get_research_model(), outline_messages
-                )
-                outline_content = outline_response["choices"][0]["message"]["content"]
-
-                # Extract JSON from response
-                try:
-                    outline_json_str = outline_content[
-                        outline_content.find("{") : outline_content.rfind("}") + 1
-                    ]
-                    outline_data = json.loads(outline_json_str)
-                    research_outline = outline_data.get("outline", [])
-                except (json.JSONDecodeError, ValueError) as e:
-                    logger.error(f"Error parsing outline JSON: {e}")
-                    # Fallback: create a simple outline if JSON parsing fails
-                    research_outline = [
-                        {
-                            "topic": "General Information",
-                            "subtopics": ["Background", "Key Concepts"],
-                        },
-                        {
-                            "topic": "Specific Aspects",
-                            "subtopics": ["Detailed Analysis", "Examples"],
-                        },
-                    ]
-
-                # Create a flat list of all topics and subtopics for tracking completeness
-                all_topics = []
-                for topic_item in research_outline:
-                    all_topics.append(topic_item["topic"])
-                    all_topics.extend(topic_item.get("subtopics", []))
-
-                # Update outline embedding now that we have the actual outline
-                outline_text = " ".join(all_topics)
-                outline_embedding = await self.get_embedding(outline_text)
-
-                # Initialize dimension-aware research tracking
-                await self.initialize_research_dimensions(all_topics, user_message)
-
-                # User interaction for outline feedback (if enabled)
-                if self.valves.INTERACTIVE_RESEARCH:
-                    # Get user feedback on the research outline
-                    if not state.get("waiting_for_outline_feedback", False):
-                        # Display the outline to the user
-                        outline_text = "### Research Outline\n\n"
-                        for topic in research_outline:
-                            outline_text += f"**{topic['topic']}**\n"
-                            for subtopic in topic.get("subtopics", []):
-                                outline_text += f"- {subtopic}\n"
-                            outline_text += "\n"
-
-                        await self.emit_message(outline_text)
-
-                        # Get user feedback (this will set the flags and state for continuation)
-                        feedback_result = await self.process_user_outline_feedback(
-                            research_outline, user_message
-                        )
-
-                        # Return empty string to pause execution until next message
-                        return ""
-                else:
-                    # Regular display of outline if interactive research is disabled
-                    # Display the outline to the user
-                    outline_text = "### Research Outline\n\n"
-                    for topic in research_outline:
-                        outline_text += f"**{topic['topic']}**\n"
-                        for subtopic in topic.get("subtopics", []):
-                            outline_text += f"- {subtopic}\n"
-                        outline_text += "\n"
-
-                    await self.emit_message(outline_text)
+                    # Now continue with the main research process using the updated research state
+                    user_message = original_query
 
                     # Initialize research state consistently
                     await self.initialize_research_state(
@@ -10349,1119 +9934,1700 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
                         research_outline,
                         all_topics,
                         outline_embedding,
-                        initial_results,
                     )
 
                     # Update token counts
-                    await self.update_token_counts(initial_results)
+                    await self.update_token_counts()
+                else:
+                    # If we're supposedly waiting for feedback but have no data,
+                    # treat as normal query (recover from error state)
+                    self.update_state("waiting_for_outline_feedback", False)
+                    logger.warning("Waiting for outline feedback but no data available")
 
-                    # Display message about continuing
-                    await self.emit_message(
-                        "\n*Continuing with research outline...*\n\n"
-                    )
-
-        # Update status to show we've moved beyond outline generation
-        await self.emit_status(
-            "info", "Research outline generated. Beginning research cycles...", False
-        )
-
-        # Initialize research variables for continued cycles
-        cycle = 1  # We've already done one cycle with the initial queries
-        max_cycles = self.valves.MAX_CYCLES
-        min_cycles = self.valves.MIN_CYCLES
-        completed_topics = set(state.get("completed_topics", set()))
-        irrelevant_topics = set(state.get("irrelevant_topics", set()))
-        search_history = state.get("search_history", [])
-        results_history = state.get("results_history", []) + (initial_results or [])
-        active_outline = list(set(all_topics) - completed_topics - irrelevant_topics)
-        cycle_summaries = state.get("cycle_summaries", [])
-
-        # Ensure consistent token counts
-        await self.update_token_counts()
-
-        # Step 4: Begin research cycles
-        while cycle < max_cycles and active_outline:
-            cycle += 1
-            await self.emit_status(
-                "info",
-                f"Research cycle {cycle}/{max_cycles}: Generating search queries...",
-                False,
-            )
-
-            # Calculate research trajectory from previous cycles
-            if cycle > 2 and results_history:
-                research_trajectory = await self.calculate_research_trajectory(
-                    search_history, results_history
-                )
-
-                # Update research trajectory
-                self.update_state("research_trajectory", research_trajectory)
-
-            # Calculate gap vector for directing research toward uncovered areas
-            gap_vector = await self.calculate_gap_vector()
-
-            # Rank active topics by priority using semantic analysis
-            prioritized_topics = await self.rank_topics_by_research_priority(
-                active_outline, gap_vector, completed_topics, results_history
-            )
-
-            # Get most important topics for this cycle (limited to 10)
-            priority_topics = prioritized_topics[:10]
-
-            # Build context for query generation with all the improved elements
-            search_context = ""
-
-            # Include original query and user feedback
-            search_context += f"### Original Query:\n{user_message}\n\n"
-
-            # If there was user feedback, include it as clarification
-            user_preferences = state.get("user_preferences", {})
-            if user_preferences.get("pdv") is not None:
-                # Try to translate PDV to words
-                pdv_words = await self.translate_pdv_to_words(
-                    user_preferences.get("pdv")
-                )
-                if pdv_words:
-                    search_context += f"### User Preferences:\nThe user is more interested in topics related to: {pdv_words}\n\n"
-
-            # Include prioritized research topics
-            search_context += "### Priority research topics for this cycle:\n"
-            for topic in priority_topics:
-                search_context += f"- {topic}\n"
-
-            # Add a separate section for all remaining topics
-            if len(active_outline) > len(priority_topics):
-                search_context += "\n### Additional topics still needing research:\n"
-                for topic in active_outline:
-                    if topic not in priority_topics:
-                        search_context += f"- {topic}\n"
-
-            # Include recent search history (only last 3 cycles)
-            if search_history:
-                search_context += "\n### Recent search queries:\n"
-                search_context += ", ".join([f"'{q}'" for q in search_history[-9:]])
-                search_context += "\n\n"
-
-            # Include previous results summary
-            if results_history:
-                search_context += "### Recent research results summary:\n\n"
-                # Use most recent results only
-                recent_results = results_history[-6:]  # Show just the latest 6 results
-
-                for i, result in enumerate(recent_results):
-                    search_context += f"Result {i+1} (Query: '{result['query']}')\n"
-                    search_context += f"URL: {result.get('url', 'No URL')}\n"
-                    search_context += f"Summary: {result['content'][:2000]}...\n\n"
-
-            # Include previous cycle summaries (last 3 only)
-            if cycle_summaries:
-                search_context += "\n### Previous cycle summaries:\n"
-                for i, summary in enumerate(cycle_summaries[-3:]):
-                    search_context += f"Cycle {cycle-3+i} Summary: {summary}\n\n"
-
-            # Include identified research gaps from dimensional analysis
-            research_dimensions = state.get("research_dimensions")
-            if research_dimensions:
-                gaps = await self.identify_research_gaps()
-                if gaps:
-                    search_context += "\n### Identified research gaps:\n"
-                    for gap in gaps:
-                        search_context += f"- Dimension {gap+1}\n"
-
-            # Include previous comprehensive summary if this is a follow-up
-            if is_follow_up and state.get("prev_comprehensive_summary"):
-                search_context += "### Previous Research Summary:\n\n"
-                summary_excerpt = state.get("prev_comprehensive_summary", "")[:5000]
-                search_context += f"{summary_excerpt}...\n\n"
-
-            # Generate new queries for this cycle
-            query_objects = await self.improved_query_generation(
-                user_message, priority_topics, search_context
-            )
-
-            # Extract query strings and topics
-            current_cycle_queries = query_objects
-
-            # Track topics used for queries to apply dampening in future cycles
-            used_topics = [
-                query_obj.get("topic", "")
-                for query_obj in current_cycle_queries
-                if query_obj.get("topic")
-            ]
-            await self.update_topic_usage_counts(used_topics)
-
-            # Display the queries to the user
-            await self.emit_message(f"### Research Cycle {cycle}: Search Queries\n\n")
-            for i, query_obj in enumerate(current_cycle_queries):
-                query = query_obj.get("query", "")
-                topic = query_obj.get("topic", "")
+            # Check if this is a follow-up query
+            is_follow_up = await self.is_follow_up_query(messages)
+            self.update_state("follow_up_mode", is_follow_up)
+    
+            # Get summary embedding if this is a follow-up
+            summary_embedding = None
+            if is_follow_up:
+                prev_comprehensive_summary = state.get("prev_comprehensive_summary", "")
+                if prev_comprehensive_summary:
+                    try:
+                        await self.emit_status(
+                            "info", "Processing follow-up query...", False
+                        )
+                        summary_embedding = await self.get_embedding(
+                            prev_comprehensive_summary
+                        )
+                        await self.emit_message("## Deep Research Mode: Follow-up\n\n")
+                        await self.emit_message(
+                            "I'll continue researching based on your follow-up query while considering our previous findings.\n\n"
+                        )
+                    except Exception as e:
+                        logger.error(f"Error getting summary embedding: {e}")
+                        # Continue without the summary embedding if there's an error
+                        is_follow_up = False
+                        self.update_state("follow_up_mode", False)
+                        await self.emit_message("## Deep Research Mode: Activated\n\n")
+                        await self.emit_message(
+                            "I'll search for comprehensive information about your query. This might take a moment...\n\n"
+                        )
+                else:
+                    is_follow_up = False
+                    self.update_state("follow_up_mode", False)
+            else:
+                await self.emit_status("info", "Starting deep research...", False)
+                await self.emit_message("## Deep Research Mode: Activated\n\n")
                 await self.emit_message(
-                    f"**Query {i+1}**: {query}\n**Topic**: {topic}\n\n"
+                    "I'll search for comprehensive information about your query. This might take a moment...\n\n"
                 )
-
-            # Extract query strings for search history
-            query_strings = [q.get("query", "") for q in current_cycle_queries]
-
-            # Add queries to search history
-            search_history.extend(query_strings)
-            self.update_state("search_history", search_history)
-
-            # Execute searches and process results SEQUENTIALLY
-            cycle_results = []
-            for query_obj in current_cycle_queries:
-                query = query_obj.get("query", "")
-                topic = query_obj.get("topic", "")
-
-                # Get query embedding for content comparison
-                try:
-                    query_embedding = await self.get_embedding(query)
-                    if not query_embedding:
+    
+            # Check if we have research state from previous feedback
+            research_state = state.get("research_state")
+            if research_state:
+                # Use the existing research state from feedback
+                research_outline = research_state.get("research_outline", [])
+                all_topics = research_state.get("all_topics", [])
+                outline_embedding = research_state.get("outline_embedding")
+                user_message = research_state.get("user_message", user_message)
+    
+                await self.emit_status(
+                    "info", "Continuing research with updated outline...", False
+                )
+    
+                # Skip to research cycles
+                initial_results = []  # We'll regenerate search results
+    
+            else:
+                # For follow-up queries, we need to generate a new research outline based on the previous summary
+                if is_follow_up:
+                    outline_embedding = await self.get_embedding(
+                        user_message
+                    )  # Create initial placeholder
+                    # Step 1: Generate initial search queries for follow-up considering previous summary
+                    await self.emit_status(
+                        "info", "Generating initial search queries for follow-up...", False
+                    )
+    
+                    initial_query_prompt = {
+                        "role": "system",
+                        "content": """You are a post-grad research assistant generating effective search queries for continued research based on an existing report.
+        Based on the user's follow-up question and the previous research summary, generate 6 initial search queries.
+        Each query should be specific, use relevant keywords, and be designed to find new information that builds on the previous research towards the new query.
+        Use quotes sparingly and as a last resort. Never use multiple sets of quotes in the same query.
+    
+        Respond ONLY with a valid JSON object and nothing else (no prose, no code fences, no metadata, no model names, no IDs).
+        JSON schema:
+        {"queries": [
+          "search query 1",
+          "search query 2",
+          "search query 3"
+        ]}
+        If unsure, return a minimal valid JSON with one query derived from the user message.
+        Start the response with '{' and end with '}'.""",
+                    }
+    
+                    initial_query_messages = [
+                        initial_query_prompt,
+                        {
+                            "role": "user",
+                            "content": f"Follow-up question: {user_message}\n\nPrevious research summary:\n{state.get('prev_comprehensive_summary', '')}...\n\nGenerate initial search queries for the follow-up question that build on the previous research.",
+                        },
+                    ]
+    
+                    # Get initial search queries
+                    query_response = await self.generate_completion(
+                        self.get_research_model(),
+                        initial_query_messages,
+                        temperature=self.valves.TEMPERATURE,
+                        user_facing=True,
+                    )
+                    query_content = query_response["choices"][0]["message"]["content"]
+    
+                    # Extract JSON from response
+                    try:
+                        query_json_str = query_content[
+                            query_content.find("{") : query_content.rfind("}") + 1
+                        ]
+                        query_data = json.loads(query_json_str)
+                        raw_queries = query_data.get("queries", [])
+    
+                        # Normalize different possible formats to a list of strings
+                        initial_queries: List[str] = []
+                        if isinstance(raw_queries, list):
+                            for q in raw_queries:
+                                if isinstance(q, str):
+                                    initial_queries.append(q)
+                                elif isinstance(q, dict):
+                                    candidate = q.get("query")
+                                    if isinstance(candidate, str):
+                                        initial_queries.append(candidate)
+    
+                        # If we didn't get any usable queries from JSON, trigger fallback
+                        if not initial_queries or any(
+                            self._looks_like_metadata_query(q) for q in initial_queries
+                        ):
+                            raise ValueError("No valid queries in JSON response")
+                    except (json.JSONDecodeError, ValueError) as e:
+                        logger.error(f"Error parsing query JSON: {e}")
+                        # Fallback: robust extraction from raw text
+                        initial_queries = self._extract_queries_from_llm_response(
+                            query_content, user_message, max_queries=3
+                        )
+    
+                    # Display the queries to the user
+                    await self.emit_message(f"### Initial Follow-up Research Queries\n\n")
+                    for i, query in enumerate(initial_queries):
+                        await self.emit_message(f"**Query {i+1}**: {query}\n\n")
+    
+                    # Execute initial searches with the follow-up queries
+                    # Use summary embedding for context relevance
+                    initial_results = []
+                    initial_seen_urls = set()  # Track URLs seen during initial research
+    
+                    for query in initial_queries:
+                        # Get query embedding for content comparison
+                        try:
+                            await self.emit_status(
+                                "info", f"Getting embedding for query: {query}", False
+                            )
+                            query_embedding = await self.get_embedding(query)
+                            if not query_embedding:
+                                # If we can't get an embedding from the model, create a default one
+                                logger.warning(
+                                    f"Failed to get embedding for '{query}', using default"
+                                )
+                                fallback_dim = self.embedding_dim or 384
+                                query_embedding = [0.0] * fallback_dim
+                        except Exception as e:
+                            logger.error(f"Error getting embedding: {e}")
+                            fallback_dim = self.embedding_dim or 384
+                            query_embedding = [0.0] * fallback_dim
+    
+                        # Process the query and get results
+                        results = await self.process_query(
+                            query,
+                            query_embedding,
+                            outline_embedding,
+                            None,
+                            summary_embedding,
+                        )
+    
+                        # Filter out any URLs we've already seen in initial research
+                        filtered_results = []
+                        for result in results:
+                            url = result.get("url", "")
+                            if url and url not in initial_seen_urls:
+                                filtered_results.append(result)
+                                initial_seen_urls.add(url)  # Mark this URL as seen
+                            else:
+                                logger.info(
+                                    f"Filtering out repeated URL in initial research: {url}"
+                                )
+    
+                        # If we filtered out all results, log it
+                        if results and not filtered_results:
+                            logger.info(
+                                f"All {len(results)} results filtered due to URL repetition in initial research"
+                            )
+                            # If all results were filtered, try to get at least one result by using the first one
+                            if results:
+                                filtered_results.append(results[0])
+                                logger.info(
+                                    f"Added back one result to ensure minimal research data"
+                                )
+    
+                        # Add non-repeated results to our collection
+                        initial_results.extend(filtered_results)
+    
+                    # Generate research outline that incorporates previous findings and new follow-up
+                    await self.emit_status(
+                        "info", "Generating research outline for follow-up...", False
+                    )
+    
+                    outline_prompt = {
+                        "role": "system",
+                        "content": """You are a post-grad research assistant creating a structured research outline.
+    	Based on the user's follow-up question, previous research summary, and new search results, create a comprehensive outline 
+    	that builds on the previous research while addressing the new aspects from the follow-up question.
+    	
+    	The outline should:
+    	1. Include relevant topics from the previous research that provide context
+    	2. Add new topics that specifically address the follow-up question
+    	3. Be organized in a hierarchical structure with main topics and subtopics
+    	4. Focus on aspects that weren't covered in depth in the previous research
+    	
+    	Format your response as a valid JSON object with the following structure:
+    	{"outline": [
+    	  {"topic": "Main topic 1", "subtopics": ["Subtopic 1.1", "Subtopic 1.2"]},
+    	  {"topic": "Main topic 2", "subtopics": ["Subtopic 2.1", "Subtopic 2.2"]}
+    	]}""",
+                    }
+    
+                    # Build context from initial search results and previous summary
+                    outline_context = "### Previous Research Summary:\n\n"
+                    outline_context += (
+                        f"{state.get('prev_comprehensive_summary', '')}...\n\n"
+                    )
+    
+                    outline_context += "### New Search Results:\n\n"
+                    for i, result in enumerate(initial_results):
+                        outline_context += f"Result {i+1} (Query: '{result['query']}')\n"
+                        outline_context += f"Title: {result['title']}\n"
+                        outline_context += f"Content: {result['content']}...\n\n"
+    
+                    outline_messages = [
+                        outline_prompt,
+                        {
+                            "role": "user",
+                            "content": f"Follow-up question: {user_message}\n\n{outline_context}\n\nGenerate a comprehensive research outline that builds on previous research while addressing the follow-up question.",
+                        },
+                    ]
+    
+                    # Generate the research outline
+                    outline_response = await self.generate_completion(
+                        self.get_research_model(), outline_messages
+                    )
+                    outline_content = outline_response["choices"][0]["message"]["content"]
+    
+                    # Extract JSON from response
+                    try:
+                        outline_json_str = outline_content[
+                            outline_content.find("{") : outline_content.rfind("}") + 1
+                        ]
+                        outline_data = json.loads(outline_json_str)
+                        research_outline = outline_data.get("outline", [])
+                    except (json.JSONDecodeError, ValueError) as e:
+                        logger.error(f"Error parsing outline JSON: {e}")
+                        # Fallback: create a simple outline if JSON parsing fails
+                        research_outline = [
+                            {
+                                "topic": "Follow-up Information",
+                                "subtopics": ["Key Aspects", "New Developments"],
+                            },
+                            {
+                                "topic": "Extended Analysis",
+                                "subtopics": ["Additional Details", "Further Examples"],
+                            },
+                        ]
+    
+                    # Create a flat list of all topics for tracking
+                    all_topics = []
+                    for topic_item in research_outline:
+                        all_topics.append(topic_item["topic"])
+                        all_topics.extend(topic_item.get("subtopics", []))
+    
+                    # Create outline embedding
+                    outline_text = " ".join(all_topics)
+                    outline_embedding = await self.get_embedding(outline_text)
+    
+                    # Initialize research dimensions
+                    await self.initialize_research_dimensions(all_topics, user_message)
+    
+                    # Display the outline to the user
+                    outline_text = "### Research Outline for Follow-up\n\n"
+                    for topic in research_outline:
+                        outline_text += f"**{topic['topic']}**\n"
+                        for subtopic in topic.get("subtopics", []):
+                            outline_text += f"- {subtopic}\n"
+                        outline_text += "\n"
+    
+                    await self.emit_message(outline_text)
+                    await self.emit_message(
+                        "\n*Continuing with research based on this outline and previous findings...*\n\n"
+                    )
+    
+                else:
+                    # Regular new query - generate initial search queries
+                    await self.emit_status(
+                        "info", "Generating initial search queries...", False
+                    )
+    
+                    initial_query_prompt = {
+                        "role": "system",
+                        "content": f"""You are a post-grad research assistant generating effective search queries.
+        The user has submitted a research query: "{user_message}".
+        Based on the user's input, generate 8 initial search queries to begin research and help us delineate the research topic.
+        Half of the queries should be broad, aimed at identifying and defining the main topic and returning core characteristic information about it.
+        The other half should be more specific, designed to find information to help expand on known base details of the user's query.
+        Use quotes sparingly and as a last resort. Never use multiple sets of quotes in the same query.
+    
+        Respond ONLY with a valid JSON object and nothing else (no prose, no code fences, no metadata, no model names, no IDs).
+        JSON schema:
+        {{"queries": [
+          "search query 1",
+          "search query 2",
+          "search query 3..."
+        ]}}
+        If unsure, return a minimal valid JSON with one query derived from the user message.
+        Start the response with '{{' and end with '}}'.""",
+                    }
+    
+                    initial_query_messages = [
+                        initial_query_prompt,
+                        {
+                            "role": "user",
+                            "content": f"Generate initial search queries for this user query: {user_message}",
+                        },
+                    ]
+    
+                    # Get initial search queries
+                    query_response = await self.generate_completion(
+                        self.get_research_model(),
+                        initial_query_messages,
+                        temperature=self.valves.TEMPERATURE,
+                        user_facing=True,
+                    )
+                    query_content = query_response["choices"][0]["message"]["content"]
+    
+                    # Extract JSON from response
+                    try:
+                        query_json_str = query_content[
+                            query_content.find("{") : query_content.rfind("}") + 1
+                        ]
+                        query_data = json.loads(query_json_str)
+                        raw_queries = query_data.get("queries", [])
+    
+                        # Normalize different possible formats to a list of strings
+                        initial_queries: List[str] = []
+                        if isinstance(raw_queries, list):
+                            for q in raw_queries:
+                                if isinstance(q, str):
+                                    initial_queries.append(q)
+                                elif isinstance(q, dict):
+                                    candidate = q.get("query")
+                                    if isinstance(candidate, str):
+                                        initial_queries.append(candidate)
+    
+                        # If we didn't get any usable queries from JSON, trigger fallback
+                        if not initial_queries or any(
+                            self._looks_like_metadata_query(q) for q in initial_queries
+                        ):
+                            raise ValueError("No valid queries in JSON response")
+                    except (json.JSONDecodeError, ValueError) as e:
+                        logger.error(f"Error parsing query JSON: {e}")
+                        # Fallback: robust extraction from raw text
+                        initial_queries = self._extract_queries_from_llm_response(
+                            query_content, user_message, max_queries=3
+                        )
+    
+                    # Display the queries to the user
+                    await self.emit_message(f"### Initial Research Queries\n\n")
+                    for i, query in enumerate(initial_queries):
+                        await self.emit_message(f"**Query {i+1}**: {query}\n\n")
+    
+                    # Step 2: Execute initial searches and collect results
+                    # Get outline embedding (placeholder - will be updated after outline is created)
+                    outline_embedding = await self.get_embedding(user_message)
+    
+                    initial_results = []
+                    for query in initial_queries:
+                        # Get query embedding for content comparison
+                        try:
+                            await self.emit_status(
+                                "info", f"Getting embedding for query: {query}", False
+                            )
+                            query_embedding = await self.get_embedding(query)
+                            if not query_embedding:
+                                # If we can't get an embedding from the model, create a default one
+                                logger.warning(
+                                    f"Failed to get embedding for '{query}', using default"
+                                )
+                                fallback_dim = self.embedding_dim or 384
+                                query_embedding = [0.0] * fallback_dim
+                        except Exception as e:
+                            logger.error(f"Error getting embedding: {e}")
+                            fallback_dim = self.embedding_dim or 384
+                            query_embedding = [0.0] * fallback_dim
+    
+                        # Process the query and get results
+                        results = await self.process_query(
+                            query,
+                            query_embedding,
+                            outline_embedding,
+                            None,
+                            summary_embedding,
+                        )
+    
+                        # Add successful results to our collection
+                        initial_results.extend(results)
+    
+                    # Check if we got any useful results
+                    useful_results = [
+                        r for r in initial_results if len(r.get("content", "")) > 200
+                    ]
+    
+                    # If we didn't get any useful results, create a minimal result to continue
+                    if not useful_results:
+                        await self.emit_message(
+                            f"*Unable to find initial search results. Creating research outline based on the query alone.*\n\n"
+                        )
+                        initial_results = [
+                            {
+                                "title": f"Information about {user_message}",
+                                "url": "",
+                                "content": f"This is a placeholder for research about {user_message}. The search failed to return usable results.",
+                                "query": user_message,
+                            }
+                        ]
+                    else:
+                        # Log the successful results
+                        logger.info(
+                            f"Found {len(useful_results)} useful results from initial queries"
+                        )
+    
+                    # Step 3: Generate research outline based on user query AND initial results
+                    await self.emit_status(
+                        "info",
+                        "Analyzing initial results and generating research outline...",
+                        False,
+                    )
+    
+                    outline_prompt = {
+                        "role": "system",
+                        "content": f"""You are a post-graduate academic scholar tasked with creating a structured research outline.
+    	Based on the user's query and the initial search results, create a comprehensive conceptual outline of additional information 
+    	needed to completely and thoroughly address the user's original query: "{user_message}".
+    	
+    	The outline must:
+    	1. Break down the query into key concepts that need to be researched and key details about important figures, details, methods, etc.
+    	2. Be organized in a hierarchical structure, with main topics directly relevant to addressing the query, and subtopics to flesh out main topics.
+    	3. Include topics discovered in the initial search results relevant to addressing the user's input, while ignoring overly-specific or unrelated topics.
+    
+        The outline MUST NOT:
+        1. Delve into philosophical or theoretical approaches, unless clearly appropriate to the subject or explicitly solicited by the user.
+        2. Include generic topics or subtopics, i.e. "considering complexities" or "understanding the question".
+        3. Reflect your own opinions, bias, notions, priorities, or other non-academic impressions of the area of research.
+    
+        Your outline should conceptually take up the entire space between an introduction and conclusion, filling in the entirety of the research volume.
+        Do NOT allow rendering artifacts, web site UI features, HTML/CSS/underlying website build language, or any other irrelevant text to distract you from your goal.
+        Don't add an appendix topic, nor an explicit introduction or conclusion topic. ONLY include the outline in your response.
+    	
+    	Format your response as a valid JSON object with the following structure:
+    	{{"outline": [
+    	  {{"topic": "Main topic 1", "subtopics": ["Subtopic 1.1", "Subtopic 1.2"]}},
+    	  {{"topic": "Main topic 2", "subtopics": ["Subtopic 2.1", "Subtopic 2.2"]}}
+    	]}}""",
+                    }
+    
+                    # Build context from initial search results
+                    outline_context = "### Initial Search Results:\n\n"
+                    for i, result in enumerate(initial_results):
+                        outline_context += f"Result {i+1} (Query: '{result['query']}')\n"
+                        outline_context += f"Title: {result['title']}\n"
+                        outline_context += f"Content: {result['content']}...\n\n"
+    
+                    outline_messages = [
+                        outline_prompt,
+                        {
+                            "role": "user",
+                            "content": f"Original query: {user_message}\n\n{outline_context}\n\nGenerate a structured research outline following the instructions in the system prompt. ",
+                        },
+                    ]
+    
+                    # Generate the research outline
+                    outline_response = await self.generate_completion(
+                        self.get_research_model(), outline_messages
+                    )
+                    outline_content = outline_response["choices"][0]["message"]["content"]
+    
+                    # Extract JSON from response
+                    try:
+                        outline_json_str = outline_content[
+                            outline_content.find("{") : outline_content.rfind("}") + 1
+                        ]
+                        outline_data = json.loads(outline_json_str)
+                        research_outline = outline_data.get("outline", [])
+                    except (json.JSONDecodeError, ValueError) as e:
+                        logger.error(f"Error parsing outline JSON: {e}")
+                        # Fallback: create a simple outline if JSON parsing fails
+                        research_outline = [
+                            {
+                                "topic": "General Information",
+                                "subtopics": ["Background", "Key Concepts"],
+                            },
+                            {
+                                "topic": "Specific Aspects",
+                                "subtopics": ["Detailed Analysis", "Examples"],
+                            },
+                        ]
+    
+                    # Create a flat list of all topics and subtopics for tracking completeness
+                    all_topics = []
+                    for topic_item in research_outline:
+                        all_topics.append(topic_item["topic"])
+                        all_topics.extend(topic_item.get("subtopics", []))
+    
+                    # Update outline embedding now that we have the actual outline
+                    outline_text = " ".join(all_topics)
+                    outline_embedding = await self.get_embedding(outline_text)
+    
+                    # Initialize dimension-aware research tracking
+                    await self.initialize_research_dimensions(all_topics, user_message)
+    
+                    # User interaction for outline feedback (if enabled)
+                    if self.valves.INTERACTIVE_RESEARCH:
+                        # Get user feedback on the research outline
+                        if not state.get("waiting_for_outline_feedback", False):
+                            # Display the outline to the user
+                            outline_text = "### Research Outline\n\n"
+                            for topic in research_outline:
+                                outline_text += f"**{topic['topic']}**\n"
+                                for subtopic in topic.get("subtopics", []):
+                                    outline_text += f"- {subtopic}\n"
+                                outline_text += "\n"
+    
+                            await self.emit_message(outline_text)
+    
+                            # Get user feedback (this will set the flags and state for continuation)
+                            feedback_result = await self.process_user_outline_feedback(
+                                research_outline, user_message
+                            )
+    
+                            # Return empty string to pause execution until next message
+                            return ""
+                    else:
+                        # Regular display of outline if interactive research is disabled
+                        # Display the outline to the user
+                        outline_text = "### Research Outline\n\n"
+                        for topic in research_outline:
+                            outline_text += f"**{topic['topic']}**\n"
+                            for subtopic in topic.get("subtopics", []):
+                                outline_text += f"- {subtopic}\n"
+                            outline_text += "\n"
+    
+                        await self.emit_message(outline_text)
+    
+                        # Initialize research state consistently
+                        await self.initialize_research_state(
+                            user_message,
+                            research_outline,
+                            all_topics,
+                            outline_embedding,
+                            initial_results,
+                        )
+    
+                        # Update token counts
+                        await self.update_token_counts(initial_results)
+    
+                        # Display message about continuing
+                        await self.emit_message(
+                            "\n*Continuing with research outline...*\n\n"
+                        )
+    
+            # Update status to show we've moved beyond outline generation
+            await self.emit_status(
+                "info", "Research outline generated. Beginning research cycles...", False
+            )
+    
+            # Initialize research variables for continued cycles
+            cycle = 1  # We've already done one cycle with the initial queries
+            max_cycles = self.valves.MAX_CYCLES
+            min_cycles = self.valves.MIN_CYCLES
+            completed_topics = set(state.get("completed_topics", set()))
+            irrelevant_topics = set(state.get("irrelevant_topics", set()))
+            search_history = state.get("search_history", [])
+            results_history = state.get("results_history", []) + (initial_results or [])
+            active_outline = list(set(all_topics) - completed_topics - irrelevant_topics)
+            cycle_summaries = state.get("cycle_summaries", [])
+    
+            # Ensure consistent token counts
+            await self.update_token_counts()
+    
+            # Step 4: Begin research cycles
+            while cycle < max_cycles and active_outline:
+                cycle += 1
+                await self.emit_status(
+                    "info",
+                    f"Research cycle {cycle}/{max_cycles}: Generating search queries...",
+                    False,
+                )
+    
+                # Calculate research trajectory from previous cycles
+                if cycle > 2 and results_history:
+                    research_trajectory = await self.calculate_research_trajectory(
+                        search_history, results_history
+                    )
+    
+                    # Update research trajectory
+                    self.update_state("research_trajectory", research_trajectory)
+    
+                # Calculate gap vector for directing research toward uncovered areas
+                gap_vector = await self.calculate_gap_vector()
+    
+                # Rank active topics by priority using semantic analysis
+                prioritized_topics = await self.rank_topics_by_research_priority(
+                    active_outline, gap_vector, completed_topics, results_history
+                )
+    
+                # Get most important topics for this cycle (limited to 10)
+                priority_topics = prioritized_topics[:10]
+    
+                # Build context for query generation with all the improved elements
+                search_context = ""
+    
+                # Include original query and user feedback
+                search_context += f"### Original Query:\n{user_message}\n\n"
+    
+                # If there was user feedback, include it as clarification
+                user_preferences = state.get("user_preferences", {})
+                if user_preferences.get("pdv") is not None:
+                    # Try to translate PDV to words
+                    pdv_words = await self.translate_pdv_to_words(
+                        user_preferences.get("pdv")
+                    )
+                    if pdv_words:
+                        search_context += f"### User Preferences:\nThe user is more interested in topics related to: {pdv_words}\n\n"
+    
+                # Include prioritized research topics
+                search_context += "### Priority research topics for this cycle:\n"
+                for topic in priority_topics:
+                    search_context += f"- {topic}\n"
+    
+                # Add a separate section for all remaining topics
+                if len(active_outline) > len(priority_topics):
+                    search_context += "\n### Additional topics still needing research:\n"
+                    for topic in active_outline:
+                        if topic not in priority_topics:
+                            search_context += f"- {topic}\n"
+    
+                # Include recent search history (only last 3 cycles)
+                if search_history:
+                    search_context += "\n### Recent search queries:\n"
+                    search_context += ", ".join([f"'{q}'" for q in search_history[-9:]])
+                    search_context += "\n\n"
+    
+                # Include previous results summary
+                if results_history:
+                    search_context += "### Recent research results summary:\n\n"
+                    # Use most recent results only
+                    recent_results = results_history[-6:]  # Show just the latest 6 results
+    
+                    for i, result in enumerate(recent_results):
+                        search_context += f"Result {i+1} (Query: '{result['query']}')\n"
+                        search_context += f"URL: {result.get('url', 'No URL')}\n"
+                        search_context += f"Summary: {result['content'][:2000]}...\n\n"
+    
+                # Include previous cycle summaries (last 3 only)
+                if cycle_summaries:
+                    search_context += "\n### Previous cycle summaries:\n"
+                    for i, summary in enumerate(cycle_summaries[-3:]):
+                        search_context += f"Cycle {cycle-3+i} Summary: {summary}\n\n"
+    
+                # Include identified research gaps from dimensional analysis
+                research_dimensions = state.get("research_dimensions")
+                if research_dimensions:
+                    gaps = await self.identify_research_gaps()
+                    if gaps:
+                        search_context += "\n### Identified research gaps:\n"
+                        for gap in gaps:
+                            search_context += f"- Dimension {gap+1}\n"
+    
+                # Include previous comprehensive summary if this is a follow-up
+                if is_follow_up and state.get("prev_comprehensive_summary"):
+                    search_context += "### Previous Research Summary:\n\n"
+                    summary_excerpt = state.get("prev_comprehensive_summary", "")[:5000]
+                    search_context += f"{summary_excerpt}...\n\n"
+    
+                # Generate new queries for this cycle
+                query_objects = await self.improved_query_generation(
+                    user_message, priority_topics, search_context
+                )
+    
+                # Extract query strings and topics
+                current_cycle_queries = query_objects
+    
+                # Track topics used for queries to apply dampening in future cycles
+                used_topics = [
+                    query_obj.get("topic", "")
+                    for query_obj in current_cycle_queries
+                    if query_obj.get("topic")
+                ]
+                await self.update_topic_usage_counts(used_topics)
+    
+                # Display the queries to the user
+                await self.emit_message(f"### Research Cycle {cycle}: Search Queries\n\n")
+                for i, query_obj in enumerate(current_cycle_queries):
+                    query = query_obj.get("query", "")
+                    topic = query_obj.get("topic", "")
+                    await self.emit_message(
+                        f"**Query {i+1}**: {query}\n**Topic**: {topic}\n\n"
+                    )
+    
+                # Extract query strings for search history
+                query_strings = [q.get("query", "") for q in current_cycle_queries]
+    
+                # Add queries to search history
+                search_history.extend(query_strings)
+                self.update_state("search_history", search_history)
+    
+                # Execute searches and process results SEQUENTIALLY
+                cycle_results = []
+                for query_obj in current_cycle_queries:
+                    query = query_obj.get("query", "")
+                    topic = query_obj.get("topic", "")
+    
+                    # Get query embedding for content comparison
+                    try:
+                        query_embedding = await self.get_embedding(query)
+                        if not query_embedding:
+                            fallback_dim = self.embedding_dim or 384
+                            query_embedding = [0.0] * fallback_dim
+                    except Exception as e:
+                        logger.error(f"Error getting embedding: {e}")
                         fallback_dim = self.embedding_dim or 384
                         query_embedding = [0.0] * fallback_dim
-                except Exception as e:
-                    logger.error(f"Error getting embedding: {e}")
-                    fallback_dim = self.embedding_dim or 384
-                    query_embedding = [0.0] * fallback_dim
-
-                # Apply semantic transformation if available
-                semantic_transformations = state.get("semantic_transformations")
-                if semantic_transformations:
-                    transformed_query = await self.apply_semantic_transformation(
-                        query_embedding, semantic_transformations
+    
+                    # Apply semantic transformation if available
+                    semantic_transformations = state.get("semantic_transformations")
+                    if semantic_transformations:
+                        transformed_query = await self.apply_semantic_transformation(
+                            query_embedding, semantic_transformations
+                        )
+                        # Use transformed embedding if available
+                        if transformed_query:
+                            query_embedding = transformed_query
+    
+                    # Process the query and get results
+                    results = await self.process_query(
+                        query,
+                        query_embedding,
+                        outline_embedding,
+                        None,
+                        summary_embedding,
                     )
-                    # Use transformed embedding if available
-                    if transformed_query:
-                        query_embedding = transformed_query
-
-                # Process the query and get results
-                results = await self.process_query(
-                    query,
-                    query_embedding,
-                    outline_embedding,
-                    None,
-                    summary_embedding,
-                )
-
-                # Add successful results to the cycle results and history
-                cycle_results.extend(results)
-                results_history.extend(results)
-
-            # Update in state
-            self.update_state("results_history", results_history)
-
-            # Step 6: Analyze results and update research outline
-            if cycle_results:
-                await self.emit_status(
-                    "info",
-                    "Analyzing search results and updating research outline...",
-                    False,
-                )
-                analysis_prompt = {
-                    "role": "system",
-                    "content": f"""You are a post-grad researcher analyzing search results and updating a research outline.
-Examine the search results and the current research outline to assess the state of research.
-This is cycle {cycle} out of a maximum of {max_cycles} research cycles.
-Determine which topics have been adequately addressed by the search results.
-Update the research outline by classifying topics into different categories.
-
-Topics should be classified as:
-- COMPLETED: Topics that have been fully or reasonably addressed with researched information.
-- PARTIAL: Topics that have minimal information and need more research. Don't let topics languish here!
-  If one hasn't been addressed in a while, reconsider if it actually has been, or if it's possibly irrelevant.
-- IRRELEVANT: Topics that are not actually relevant to the main query, are red herrings, 
-  based on misidentified subjects, or are website artifacts rather than substantive topics.
-  For example, mark as irrelevant any topics about unrelated subjects that were mistakenly
-  included due to ambiguous terms, incorrect definitions for acronyms with multiple meanings,
-  or page elements/advertisements from websites that don't relate to the actual query.
-- NEW: New topics discovered in the search results that should be added to the research.
-  Topics that feel like a logical extension of the user's line of questioning and direction of research, 
-  or that are clearly important to a specific subject but aren't currently included, belong here.
-
-Remember that the research ultimately aims to address the original query: "{user_message}".
-
-Format your response as a valid JSON object with the following structure:
-{{
-  "completed_topics": ["Topic 1", "Subtopic 2.1"],
-  "partial_topics": ["Topic 2"],
-  "irrelevant_topics": ["Topic that's a distraction", "Misidentified subject"],
-  "new_topics": ["New topic discovered"],
-  "analysis": "Brief analysis of what we've learned so far with a focus on results from this past cycle"
-}}""",
-                }
-
-                # Create a context with the current outline and search results
-                analysis_context = "### Current Research Outline Topics:\n"
-                analysis_context += "\n".join(
-                    [f"- {topic}" for topic in active_outline]
-                )
-                analysis_context += "\n\n### Latest Search Results:\n\n"
-
-                for i, result in enumerate(cycle_results):
-                    analysis_context += f"Result {i+1} (Query: '{result['query']}')\n"
-                    analysis_context += f"Title: {result['title']}\n"
-                    analysis_context += f"Content: {result['content'][:2000]}...\n\n"
-
-                # Include previous cycle summaries for continuity
-                if cycle_summaries:
-                    analysis_context += "\n### Previous cycle summaries:\n"
-                    for i, summary in enumerate(cycle_summaries):
-                        analysis_context += f"Cycle {i+1} Summary: {summary}\n\n"
-
-                # Include lists of completed and irrelevant topics
-                if completed_topics:
-                    analysis_context += "\n### Already completed topics:\n"
-                    for topic in completed_topics:
-                        analysis_context += f"- {topic}\n"
-
-                if irrelevant_topics:
-                    analysis_context += "\n### Already identified irrelevant topics:\n"
-                    for topic in irrelevant_topics:
-                        analysis_context += f"- {topic}\n"
-
-                # Include user preferences if applicable
-                if (
-                    self.valves.USER_PREFERENCE_THROUGHOUT
-                    and state.get("user_preferences", {}).get("pdv") is not None
-                ):
-                    analysis_context += (
-                        "\n### User preferences are being applied to research\n"
+    
+                    # Add successful results to the cycle results and history
+                    cycle_results.extend(results)
+                    results_history.extend(results)
+    
+                # Update in state
+                self.update_state("results_history", results_history)
+    
+                # Step 6: Analyze results and update research outline
+                if cycle_results:
+                    await self.emit_status(
+                        "info",
+                        "Analyzing search results and updating research outline...",
+                        False,
                     )
-
-                analysis_messages = [
-                    analysis_prompt,
-                    {
-                        "role": "user",
-                        "content": f"Original query: {user_message}\n\n{analysis_context}\n\nAnalyze these results and update the research outline.",
-                    },
-                ]
-
-                try:
-                    analysis_response = await self.generate_completion(
-                        self.get_research_model(), analysis_messages
-                    )
-                    analysis_content = analysis_response["choices"][0]["message"][
-                        "content"
-                    ]
-
-                    # Extract JSON from response
-                    analysis_json_str = analysis_content[
-                        analysis_content.find("{") : analysis_content.rfind("}") + 1
-                    ]
-                    analysis_data = json.loads(analysis_json_str)
-
-                    # Update completed topics
-                    newly_completed = set(analysis_data.get("completed_topics", []))
-                    completed_topics.update(newly_completed)
-                    self.update_state("completed_topics", completed_topics)
-
-                    # Update irrelevant topics
-                    newly_irrelevant = set(analysis_data.get("irrelevant_topics", []))
-                    irrelevant_topics.update(newly_irrelevant)
-                    self.update_state("irrelevant_topics", irrelevant_topics)
-
-                    # Add any new topics discovered
-                    new_topics = analysis_data.get("new_topics", [])
-                    for topic in new_topics:
-                        if (
-                            topic not in all_topics
-                            and topic not in completed_topics
-                            and topic not in irrelevant_topics
-                        ):
-                            active_outline.append(topic)
-                            all_topics.append(topic)
-
-                    # Update active outline by removing completed and irrelevant topics
-                    active_outline = [
-                        topic
-                        for topic in active_outline
-                        if topic not in completed_topics
-                        and topic not in irrelevant_topics
-                    ]
-
-                    # Update in state
-                    self.update_state("active_outline", active_outline)
-                    self.update_state("all_topics", all_topics)
-
-                    # Save the analysis summary
-                    cycle_summaries.append(
-                        analysis_data.get("analysis", f"Analysis for cycle {cycle}")
-                    )
-                    self.update_state("cycle_summaries", cycle_summaries)
-
-                    # Create the current checklist for display to the user
-                    current_checklist = {
-                        "completed": newly_completed,
-                        "partial": set(analysis_data.get("partial_topics", [])),
-                        "irrelevant": newly_irrelevant,
-                        "new": set(new_topics),
-                        "remaining": set(active_outline),
+                    analysis_prompt = {
+                        "role": "system",
+                        "content": f"""You are a post-grad researcher analyzing search results and updating a research outline.
+    Examine the search results and the current research outline to assess the state of research.
+    This is cycle {cycle} out of a maximum of {max_cycles} research cycles.
+    Determine which topics have been adequately addressed by the search results.
+    Update the research outline by classifying topics into different categories.
+    
+    Topics should be classified as:
+    - COMPLETED: Topics that have been fully or reasonably addressed with researched information.
+    - PARTIAL: Topics that have minimal information and need more research. Don't let topics languish here!
+      If one hasn't been addressed in a while, reconsider if it actually has been, or if it's possibly irrelevant.
+    - IRRELEVANT: Topics that are not actually relevant to the main query, are red herrings, 
+      based on misidentified subjects, or are website artifacts rather than substantive topics.
+      For example, mark as irrelevant any topics about unrelated subjects that were mistakenly
+      included due to ambiguous terms, incorrect definitions for acronyms with multiple meanings,
+      or page elements/advertisements from websites that don't relate to the actual query.
+    - NEW: New topics discovered in the search results that should be added to the research.
+      Topics that feel like a logical extension of the user's line of questioning and direction of research, 
+      or that are clearly important to a specific subject but aren't currently included, belong here.
+    
+    Remember that the research ultimately aims to address the original query: "{user_message}".
+    
+    Format your response as a valid JSON object with the following structure:
+    {{
+      "completed_topics": ["Topic 1", "Subtopic 2.1"],
+      "partial_topics": ["Topic 2"],
+      "irrelevant_topics": ["Topic that's a distraction", "Misidentified subject"],
+      "new_topics": ["New topic discovered"],
+      "analysis": "Brief analysis of what we've learned so far with a focus on results from this past cycle"
+    }}""",
                     }
-
-                    # Display analysis to the user, localized based on OUTPUT_LANGUAGE
-                    output_lang = (self.valves.OUTPUT_LANGUAGE or "auto").lower()
-                    is_pl = output_lang in ("pl", "polish")
-
-                    if is_pl:
-                        analysis_heading = f"### Analiza badań (cykl {cycle})\n\n"
-                        base_analysis = analysis_data.get(
-                            "analysis", "Analiza niedostępna."
+    
+                    # Create a context with the current outline and search results
+                    analysis_context = "### Current Research Outline Topics:\n"
+                    analysis_context += "\n".join(
+                        [f"- {topic}" for topic in active_outline]
+                    )
+                    analysis_context += "\n\n### Latest Search Results:\n\n"
+    
+                    for i, result in enumerate(cycle_results):
+                        analysis_context += f"Result {i+1} (Query: '{result['query']}')\n"
+                        analysis_context += f"Title: {result['title']}\n"
+                        analysis_context += f"Content: {result['content'][:2000]}...\n\n"
+    
+                    # Include previous cycle summaries for continuity
+                    if cycle_summaries:
+                        analysis_context += "\n### Previous cycle summaries:\n"
+                        for i, summary in enumerate(cycle_summaries):
+                            analysis_context += f"Cycle {i+1} Summary: {summary}\n\n"
+    
+                    # Include lists of completed and irrelevant topics
+                    if completed_topics:
+                        analysis_context += "\n### Already completed topics:\n"
+                        for topic in completed_topics:
+                            analysis_context += f"- {topic}\n"
+    
+                    if irrelevant_topics:
+                        analysis_context += "\n### Already identified irrelevant topics:\n"
+                        for topic in irrelevant_topics:
+                            analysis_context += f"- {topic}\n"
+    
+                    # Include user preferences if applicable
+                    if (
+                        self.valves.USER_PREFERENCE_THROUGHOUT
+                        and state.get("user_preferences", {}).get("pdv") is not None
+                    ):
+                        analysis_context += (
+                            "\n### User preferences are being applied to research\n"
                         )
-                        completed_label = "**Zrealizowane tematy:**\n"
-                        partial_label = "**Tematy częściowo opracowane:**\n"
-                        irrelevant_label = (
-                            "**Tematy nieistotne / rozpraszające:**\n"
+    
+                    analysis_messages = [
+                        analysis_prompt,
+                        {
+                            "role": "user",
+                            "content": f"Original query: {user_message}\n\n{analysis_context}\n\nAnalyze these results and update the research outline.",
+                        },
+                    ]
+    
+                    try:
+                        analysis_response = await self.generate_completion(
+                            self.get_research_model(), analysis_messages
                         )
-                        new_label = "**Nowe odkryte tematy:**\n"
-                        remaining_label = "**Pozostałe tematy:**\n"
-                        more_suffix = " więcej"
-                    else:
-                        analysis_heading = f"### Research Analysis (Cycle {cycle})\n\n"
-                        base_analysis = analysis_data.get(
-                            "analysis", "Analysis not available."
+                        analysis_content = analysis_response["choices"][0]["message"][
+                            "content"
+                        ]
+    
+                        # Extract JSON from response
+                        analysis_json_str = analysis_content[
+                            analysis_content.find("{") : analysis_content.rfind("}") + 1
+                        ]
+                        analysis_data = json.loads(analysis_json_str)
+    
+                        # Update completed topics
+                        newly_completed = set(analysis_data.get("completed_topics", []))
+                        completed_topics.update(newly_completed)
+                        self.update_state("completed_topics", completed_topics)
+    
+                        # Update irrelevant topics
+                        newly_irrelevant = set(analysis_data.get("irrelevant_topics", []))
+                        irrelevant_topics.update(newly_irrelevant)
+                        self.update_state("irrelevant_topics", irrelevant_topics)
+    
+                        # Add any new topics discovered
+                        new_topics = analysis_data.get("new_topics", [])
+                        for topic in new_topics:
+                            if (
+                                topic not in all_topics
+                                and topic not in completed_topics
+                                and topic not in irrelevant_topics
+                            ):
+                                active_outline.append(topic)
+                                all_topics.append(topic)
+    
+                        # Update active outline by removing completed and irrelevant topics
+                        active_outline = [
+                            topic
+                            for topic in active_outline
+                            if topic not in completed_topics
+                            and topic not in irrelevant_topics
+                        ]
+    
+                        # Update in state
+                        self.update_state("active_outline", active_outline)
+                        self.update_state("all_topics", all_topics)
+    
+                        # Save the analysis summary
+                        cycle_summaries.append(
+                            analysis_data.get("analysis", f"Analysis for cycle {cycle}")
                         )
-                        completed_label = "**Topics Completed:**\n"
-                        partial_label = "**Topics Partially Addressed:**\n"
-                        irrelevant_label = "**Irrelevant/Distraction Topics:**\n"
-                        new_label = "**New Topics Discovered:**\n"
-                        remaining_label = "**Remaining Topics:**\n"
-                        more_suffix = " more"
-
-                    analysis_text = analysis_heading
-                    analysis_text += f"{base_analysis}\n\n"
-
-                    # Collapsible section for search results from this cycle
-                    results_details = ""
-                    if cycle_results:
-                        for i, result in enumerate(cycle_results):
-                            title = result.get("title", "N/A")
-                            url = result.get("url", "N/A")
-                            query = result.get("query", "N/A")
-                            content_summary = result.get("content", "")
-                            summary_preview = (
-                                (content_summary[:300] + "...")
-                                if len(content_summary) > 300
-                                else content_summary
+                        self.update_state("cycle_summaries", cycle_summaries)
+    
+                        # Create the current checklist for display to the user
+                        current_checklist = {
+                            "completed": newly_completed,
+                            "partial": set(analysis_data.get("partial_topics", [])),
+                            "irrelevant": newly_irrelevant,
+                            "new": set(new_topics),
+                            "remaining": set(active_outline),
+                        }
+    
+                        # Display analysis to the user, localized based on OUTPUT_LANGUAGE
+                        output_lang = (self.valves.OUTPUT_LANGUAGE or "auto").lower()
+                        is_pl = output_lang in ("pl", "polish")
+    
+                        if is_pl:
+                            analysis_heading = f"### Analiza badań (cykl {cycle})\n\n"
+                            base_analysis = analysis_data.get(
+                                "analysis", "Analiza niedostępna."
                             )
-
-                            results_details += f"**Result {i+1}: {title}**\n"
-                            results_details += f"URL: {url}\n"
-                            results_details += f"Query: '{query}'\n"
-                            results_details += f"Summary: {summary_preview}\n\n"
-
-                        if results_details:
-                            results_summary = (
-                                f"Pokaż {len(cycle_results)} wyników z tego cyklu"
+                            completed_label = "**Zrealizowane tematy:**\n"
+                            partial_label = "**Tematy częściowo opracowane:**\n"
+                            irrelevant_label = (
+                                "**Tematy nieistotne / rozpraszające:**\n"
+                            )
+                            new_label = "**Nowe odkryte tematy:**\n"
+                            remaining_label = "**Pozostałe tematy:**\n"
+                            more_suffix = " więcej"
+                        else:
+                            analysis_heading = f"### Research Analysis (Cycle {cycle})\n\n"
+                            base_analysis = analysis_data.get(
+                                "analysis", "Analysis not available."
+                            )
+                            completed_label = "**Topics Completed:**\n"
+                            partial_label = "**Topics Partially Addressed:**\n"
+                            irrelevant_label = "**Irrelevant/Distraction Topics:**\n"
+                            new_label = "**New Topics Discovered:**\n"
+                            remaining_label = "**Remaining Topics:**\n"
+                            more_suffix = " more"
+    
+                        analysis_text = analysis_heading
+                        analysis_text += f"{base_analysis}\n\n"
+    
+                        # Collapsible section for search results from this cycle
+                        results_details = ""
+                        if cycle_results:
+                            for i, result in enumerate(cycle_results):
+                                title = result.get("title", "N/A")
+                                url = result.get("url", "N/A")
+                                query = result.get("query", "N/A")
+                                content_summary = result.get("content", "")
+                                summary_preview = (
+                                    (content_summary[:300] + "...")
+                                    if len(content_summary) > 300
+                                    else content_summary
+                                )
+    
+                                results_details += f"**Result {i+1}: {title}**\n"
+                                results_details += f"URL: {url}\n"
+                                results_details += f"Query: '{query}'\n"
+                                results_details += f"Summary: {summary_preview}\n\n"
+    
+                            if results_details:
+                                results_summary = (
+                                    f"Pokaż {len(cycle_results)} wyników z tego cyklu"
+                                    if is_pl
+                                    else f"View {len(cycle_results)} search results from this cycle"
+                                )
+                                analysis_text += (
+                                    f"<details>\n<summary>{results_summary}</summary>\n\n"
+                                    f"{results_details}</details>\n\n"
+                                )
+    
+                        # Collapsible section for detailed topic updates
+                        topic_details = ""
+                        if newly_completed:
+                            topic_details += completed_label
+                            for topic in newly_completed:
+                                topic_details += f"✓ {topic}\n"
+                            topic_details += "\n"
+    
+                        if analysis_data.get("partial_topics"):
+                            partial_topics = analysis_data.get("partial_topics")
+                            topic_details += partial_label
+                            # Show only first 5 partial topics
+                            for topic in partial_topics[:5]:
+                                topic_details += f"⚪ {topic}\n"
+                            # Add count of additional topics if there are more than 5
+                            if len(partial_topics) > 5:
+                                topic_details += (
+                                    f"...and {len(partial_topics) - 5}{more_suffix}\n"
+                                )
+                            topic_details += "\n"
+    
+                        # Add display for irrelevant topics
+                        if newly_irrelevant:
+                            topic_details += irrelevant_label
+                            for topic in newly_irrelevant:
+                                topic_details += f"✗ {topic}\n"
+                            topic_details += "\n"
+    
+                        if new_topics:
+                            topic_details += new_label
+                            for topic in new_topics:
+                                topic_details += f"+ {topic}\n"
+                            topic_details += "\n"
+    
+                        if active_outline:
+                            topic_details += remaining_label
+                            for topic in active_outline[:5]:  # Show just the first 5
+                                topic_details += f"□ {topic}\n"
+                            if len(active_outline) > 5:
+                                topic_details += (
+                                    f"...and {len(active_outline) - 5}{more_suffix}\n"
+                                )
+                            topic_details += "\n"
+    
+                        if topic_details:
+                            topic_summary = (
+                                "Pokaż szczegółowe aktualizacje tematów"
                                 if is_pl
-                                else f"View {len(cycle_results)} search results from this cycle"
+                                else "View detailed topic updates"
                             )
                             analysis_text += (
-                                f"<details>\n<summary>{results_summary}</summary>\n\n"
-                                f"{results_details}</details>\n\n"
+                                f"<details>\n<summary>{topic_summary}</summary>\n\n"
+                                f"{topic_details}</details>\n\n"
                             )
-
-                    # Collapsible section for detailed topic updates
-                    topic_details = ""
-                    if newly_completed:
-                        topic_details += completed_label
-                        for topic in newly_completed:
-                            topic_details += f"✓ {topic}\n"
-                        topic_details += "\n"
-
-                    if analysis_data.get("partial_topics"):
-                        partial_topics = analysis_data.get("partial_topics")
-                        topic_details += partial_label
-                        # Show only first 5 partial topics
-                        for topic in partial_topics[:5]:
-                            topic_details += f"⚪ {topic}\n"
-                        # Add count of additional topics if there are more than 5
-                        if len(partial_topics) > 5:
-                            topic_details += (
-                                f"...and {len(partial_topics) - 5}{more_suffix}\n"
-                            )
-                        topic_details += "\n"
-
-                    # Add display for irrelevant topics
-                    if newly_irrelevant:
-                        topic_details += irrelevant_label
-                        for topic in newly_irrelevant:
-                            topic_details += f"✗ {topic}\n"
-                        topic_details += "\n"
-
-                    if new_topics:
-                        topic_details += new_label
-                        for topic in new_topics:
-                            topic_details += f"+ {topic}\n"
-                        topic_details += "\n"
-
-                    if active_outline:
-                        topic_details += remaining_label
-                        for topic in active_outline[:5]:  # Show just the first 5
-                            topic_details += f"□ {topic}\n"
-                        if len(active_outline) > 5:
-                            topic_details += (
-                                f"...and {len(active_outline) - 5}{more_suffix}\n"
-                            )
-                        topic_details += "\n"
-
-                    if topic_details:
-                        topic_summary = (
-                            "Pokaż szczegółowe aktualizacje tematów"
-                            if is_pl
-                            else "View detailed topic updates"
-                        )
-                        analysis_text += (
-                            f"<details>\n<summary>{topic_summary}</summary>\n\n"
-                            f"{topic_details}</details>\n\n"
-                        )
-
-                    # Store dimension coverage in state but don't display it during cycles
-                    research_dimensions = state.get("research_dimensions")
-                    if research_dimensions:
-                        try:
-                            # Store the coverage for later display at summary
-                            state["latest_dimension_coverage"] = research_dimensions[
-                                "coverage"
-                            ].copy()
-                            self.update_state(
-                                "latest_dimension_coverage",
-                                research_dimensions["coverage"],
-                            )
-                        except Exception as e:
-                            logger.error(f"Error storing dimension coverage: {e}")
-
-                    await self.emit_message(analysis_text)
-
-                    # Update dimension coverage for each result to improve tracking
-                    for result in cycle_results:
-                        content = result.get("content", "")
-                        if content:
-                            # Use similarity to query as quality factor (0.5-1.0 range)
-                            quality = 0.5
-                            if "similarity" in result:
-                                quality = 0.5 + result["similarity"] * 0.5
-                            await self.update_dimension_coverage(content, quality)
-
-                except Exception as e:
-                    logger.error(f"Error analyzing results: {e}")
-                    await self.emit_message(
-                        f"### Research Progress (Cycle {cycle})\n\nContinuing research on remaining topics...\n\n"
-                    )
-                    # Mark one topic as completed to ensure progress
-                    if active_outline:
-                        # Find the most covered topic based on similarities to gathered results
-                        topic_scores = {}
-
-                        # Only attempt similarity analysis if we have results
-                        if cycle_results:
-                            for topic in active_outline:
-                                topic_embedding = await self.get_embedding(topic)
-                                if topic_embedding:
-                                    # Calculate similarity to each result
-                                    topic_score = 0.0
-                                    for result in cycle_results:
-                                        content = result.get("content", "")[
-                                            :1000
-                                        ]  # Use first 1000 chars
-                                        content_embedding = await self.get_embedding(
-                                            content
-                                        )
-                                        if content_embedding:
-                                            sim = cosine_similarity(
-                                                [topic_embedding], [content_embedding]
-                                            )[0][0]
-                                            topic_score += sim
-
-                                    # Average the score
-                                    if cycle_results:
-                                        topic_score /= len(cycle_results)
-
-                                    topic_scores[topic] = topic_score
-
-                        # If we have scores, select the highest; otherwise just take the first one
-                        if topic_scores:
-                            completed_topic = max(
-                                topic_scores.items(), key=lambda x: x[1]
-                            )[0]
-                            logger.info(
-                                f"Selected most covered topic: {completed_topic} (score: {topic_scores[completed_topic]:.3f})"
-                            )
-                        else:
-                            completed_topic = active_outline[0]
-                            logger.info(
-                                f"No similarity data available, selected first topic: {completed_topic}"
-                            )
-
-                        completed_topics.add(completed_topic)
-                        self.update_state("completed_topics", completed_topics)
-
-                        active_outline.remove(completed_topic)
-                        self.update_state("active_outline", active_outline)
-
+    
+                        # Store dimension coverage in state but don't display it during cycles
+                        research_dimensions = state.get("research_dimensions")
+                        if research_dimensions:
+                            try:
+                                # Store the coverage for later display at summary
+                                state["latest_dimension_coverage"] = research_dimensions[
+                                    "coverage"
+                                ].copy()
+                                self.update_state(
+                                    "latest_dimension_coverage",
+                                    research_dimensions["coverage"],
+                                )
+                            except Exception as e:
+                                logger.error(f"Error storing dimension coverage: {e}")
+    
+                        await self.emit_message(analysis_text)
+    
+                        # Update dimension coverage for each result to improve tracking
+                        for result in cycle_results:
+                            content = result.get("content", "")
+                            if content:
+                                # Use similarity to query as quality factor (0.5-1.0 range)
+                                quality = 0.5
+                                if "similarity" in result:
+                                    quality = 0.5 + result["similarity"] * 0.5
+                                await self.update_dimension_coverage(content, quality)
+    
+                    except Exception as e:
+                        logger.error(f"Error analyzing results: {e}")
                         await self.emit_message(
-                            f"**Topic Addressed:** {completed_topic}\n\n"
+                            f"### Research Progress (Cycle {cycle})\n\nContinuing research on remaining topics...\n\n"
                         )
-                        # Add minimal analysis to cycle summaries
-                        cycle_summaries.append(f"Completed topic: {completed_topic}")
-                        self.update_state("cycle_summaries", cycle_summaries)
-
-            # Check termination criteria
-            if not active_outline or active_outline == []:
-                await self.emit_status(
-                    "info", "All research topics have been addressed!", False
-                )
-                break
-
-            if cycle >= min_cycles and len(completed_topics) / len(all_topics) > 0.7:
+                        # Mark one topic as completed to ensure progress
+                        if active_outline:
+                            # Find the most covered topic based on similarities to gathered results
+                            topic_scores = {}
+    
+                            # Only attempt similarity analysis if we have results
+                            if cycle_results:
+                                for topic in active_outline:
+                                    topic_embedding = await self.get_embedding(topic)
+                                    if topic_embedding:
+                                        # Calculate similarity to each result
+                                        topic_score = 0.0
+                                        for result in cycle_results:
+                                            content = result.get("content", "")[
+                                                :1000
+                                            ]  # Use first 1000 chars
+                                            content_embedding = await self.get_embedding(
+                                                content
+                                            )
+                                            if content_embedding:
+                                                sim = cosine_similarity(
+                                                    [topic_embedding], [content_embedding]
+                                                )[0][0]
+                                                topic_score += sim
+    
+                                        # Average the score
+                                        if cycle_results:
+                                            topic_score /= len(cycle_results)
+    
+                                        topic_scores[topic] = topic_score
+    
+                            # If we have scores, select the highest; otherwise just take the first one
+                            if topic_scores:
+                                completed_topic = max(
+                                    topic_scores.items(), key=lambda x: x[1]
+                                )[0]
+                                logger.info(
+                                    f"Selected most covered topic: {completed_topic} (score: {topic_scores[completed_topic]:.3f})"
+                                )
+                            else:
+                                completed_topic = active_outline[0]
+                                logger.info(
+                                    f"No similarity data available, selected first topic: {completed_topic}"
+                                )
+    
+                            completed_topics.add(completed_topic)
+                            self.update_state("completed_topics", completed_topics)
+    
+                            active_outline.remove(completed_topic)
+                            self.update_state("active_outline", active_outline)
+    
+                            await self.emit_message(
+                                f"**Topic Addressed:** {completed_topic}\n\n"
+                            )
+                            # Add minimal analysis to cycle summaries
+                            cycle_summaries.append(f"Completed topic: {completed_topic}")
+                            self.update_state("cycle_summaries", cycle_summaries)
+    
+                # Check termination criteria
+                if not active_outline or active_outline == []:
+                    await self.emit_status(
+                        "info", "All research topics have been addressed!", False
+                    )
+                    break
+    
+                if cycle >= min_cycles and len(completed_topics) / len(all_topics) > 0.7:
+                    await self.emit_status(
+                        "info",
+                        "Most research topics have been addressed. Finalizing...",
+                        False,
+                    )
+                    break
+    
+                # Continue to next cycle if we haven't hit max_cycles
+                if cycle >= max_cycles:
+                    await self.emit_status(
+                        "info",
+                        f"Maximum research cycles ({max_cycles}) reached. Finalizing...",
+                        False,
+                    )
+                    break
+    
                 await self.emit_status(
                     "info",
-                    "Most research topics have been addressed. Finalizing...",
+                    f"Research cycle {cycle} complete. Moving to next cycle...",
                     False,
                 )
-                break
-
-            # Continue to next cycle if we haven't hit max_cycles
-            if cycle >= max_cycles:
+    
+            # Apply stepped compression to all research results if enabled
+            if self.valves.STEPPED_SYNTHESIS_COMPRESSION and len(results_history) > 2:
                 await self.emit_status(
-                    "info",
-                    f"Maximum research cycles ({max_cycles}) reached. Finalizing...",
-                    False,
+                    "info", "Applying stepped compression to research results...", False
                 )
-                break
-
+    
+                # Track token counts before compression
+                total_tokens_before = 0
+                for result in results_history:
+                    tokens = await self.count_tokens(result.get("content", ""))
+                    total_tokens_before += tokens
+    
+                # Apply stepped compression to results
+                results_history = await self.apply_stepped_compression(
+                    results_history,
+                    query_embedding if "query_embedding" in locals() else None,
+                    summary_embedding,
+                )
+    
+                # Calculate total tokens after compression
+                total_tokens_after = sum(
+                    result.get("tokens", 0) for result in results_history
+                )
+    
+                # Log token reduction
+                token_reduction = total_tokens_before - total_tokens_after
+                if total_tokens_before > 0:
+                    percent_reduction = (token_reduction / total_tokens_before) * 100
+                    logger.info(
+                        f"Stepped compression: {total_tokens_before} → {total_tokens_after} tokens "
+                        f"(saved {token_reduction} tokens, {percent_reduction:.1f}% reduction)"
+                    )
+    
+                    await self.emit_status(
+                        "info",
+                        f"Compressed research results from {total_tokens_before} to {total_tokens_after} tokens",
+                        False,
+                    )
+    
+            # Step 7: Generate refined synthesis outline
             await self.emit_status(
-                "info",
-                f"Research cycle {cycle} complete. Moving to next cycle...",
-                False,
+                "info", "Generating refined outline for synthesis...", False
             )
-
-        # Apply stepped compression to all research results if enabled
-        if self.valves.STEPPED_SYNTHESIS_COMPRESSION and len(results_history) > 2:
-            await self.emit_status(
-                "info", "Applying stepped compression to research results...", False
+    
+            synthesis_outline = await self.generate_synthesis_outline(
+                research_outline, completed_topics, user_message, results_history
             )
-
-            # Track token counts before compression
-            total_tokens_before = 0
-            for result in results_history:
-                tokens = await self.count_tokens(result.get("content", ""))
-                total_tokens_before += tokens
-
-            # Apply stepped compression to results
-            results_history = await self.apply_stepped_compression(
-                results_history,
-                query_embedding if "query_embedding" in locals() else None,
-                summary_embedding,
+    
+            # If synthesis outline generation failed, use original
+            if not synthesis_outline:
+                synthesis_outline = research_outline
+    
+            # Step 8: Synthesize final answer with the selected model - Section by Section with citations
+            await self.emit_synthesis_status(
+                "Synthesizing comprehensive answer from research results..."
             )
-
-            # Calculate total tokens after compression
-            total_tokens_after = sum(
-                result.get("tokens", 0) for result in results_history
-            )
-
-            # Log token reduction
-            token_reduction = total_tokens_before - total_tokens_after
-            if total_tokens_before > 0:
-                percent_reduction = (token_reduction / total_tokens_before) * 100
-                logger.info(
-                    f"Stepped compression: {total_tokens_before} → {total_tokens_after} tokens "
-                    f"(saved {token_reduction} tokens, {percent_reduction:.1f}% reduction)"
-                )
-
-                await self.emit_status(
-                    "info",
-                    f"Compressed research results from {total_tokens_before} to {total_tokens_after} tokens",
-                    False,
-                )
-
-        # Step 7: Generate refined synthesis outline
-        await self.emit_status(
-            "info", "Generating refined outline for synthesis...", False
-        )
-
-        synthesis_outline = await self.generate_synthesis_outline(
-            research_outline, completed_topics, user_message, results_history
-        )
-
-        # If synthesis outline generation failed, use original
-        if not synthesis_outline:
-            synthesis_outline = research_outline
-
-        # Step 8: Synthesize final answer with the selected model - Section by Section with citations
-        await self.emit_synthesis_status(
-            "Synthesizing comprehensive answer from research results..."
-        )
-        await self.emit_message("\n\n---\n\n### Research Complete\n\n")
-
-        # Make sure dimensions data is up-to-date
-        await self.update_research_dimensions_display()
-
-        # Display the final research outline first
-        await self.emit_message("### Final Research Outline\n\n")
-        for topic_item in synthesis_outline:
-            topic = topic_item["topic"]
-            subtopics = topic_item.get("subtopics", [])
-
-            await self.emit_message(f"**{topic}**\n")
-            for subtopic in subtopics:
-                await self.emit_message(f"- {subtopic}\n")
-            await self.emit_message("\n")
-
-        # Display research dimensions after the outline
-        await self.emit_status(
-            "info", "Displaying research dimensions coverage...", False
-        )
-        await self.emit_message("### Research Dimensions (Ordered)\n\n")
-
-        research_dimensions = state.get("research_dimensions")
-        latest_coverage = state.get("latest_dimension_coverage")
-
-        if latest_coverage and research_dimensions:
-            try:
-                # Translate dimensions to words
-                dimension_labels = await self.translate_dimensions_to_words(
-                    research_dimensions, latest_coverage
-                )
-
-                # Sort dimensions by coverage (highest to lowest)
-                sorted_dimensions = sorted(
-                    dimension_labels, key=lambda x: x.get("coverage", 0), reverse=True
-                )
-
-                # Display dimensions without coverage percentages
-                for dim in sorted_dimensions[:10]:  # Limit to top 10
-                    await self.emit_message(f"- {dim.get('words', 'Dimension')}\n")
-
+            await self.emit_message("\n\n---\n\n### Research Complete\n\n")
+    
+            # Make sure dimensions data is up-to-date
+            await self.update_research_dimensions_display()
+    
+            # Display the final research outline first
+            await self.emit_message("### Final Research Outline\n\n")
+            for topic_item in synthesis_outline:
+                topic = topic_item["topic"]
+                subtopics = topic_item.get("subtopics", [])
+    
+                await self.emit_message(f"**{topic}**\n")
+                for subtopic in subtopics:
+                    await self.emit_message(f"- {subtopic}\n")
                 await self.emit_message("\n")
-            except Exception as e:
-                logger.error(f"Error displaying final dimension coverage: {e}")
-                await self.emit_message("*Error displaying research dimensions*\n\n")
-        else:
-            logger.warning("No research dimensions data available for display")
-            await self.emit_message("*No research dimension data available*\n\n")
-
-        # Determine which model to use for synthesis
-        synthesis_model = self.get_synthesis_model()
-        await self.emit_synthesis_status(
-            f"Using {synthesis_model} for section generation..."
-        )
-
-        # Clear section content storage
-        self.update_state("section_synthesized_content", {})
-        self.update_state("subtopic_synthesized_content", {})
-        self.update_state("section_sources_map", {})
-        self.update_state("section_citations", {})
-
-        # Initialize global citation map if not exists
-        if "global_citation_map" not in state:
-            self.update_state("global_citation_map", {})
-
-        # Process each main topic and its subtopics
-        compiled_sections = {}
-
-        # Include only main topics that are not in irrelevant_topics
-        relevant_topics = [
-            topic
-            for topic in synthesis_outline
-            if topic["topic"] not in irrelevant_topics
-        ]
-
-        # If we have no relevant topics, use a simple structure
-        if not relevant_topics:
+    
+            # Display research dimensions after the outline
+            await self.emit_status(
+                "info", "Displaying research dimensions coverage...", False
+            )
+            await self.emit_message("### Research Dimensions (Ordered)\n\n")
+    
+            research_dimensions = state.get("research_dimensions")
+            latest_coverage = state.get("latest_dimension_coverage")
+    
+            if latest_coverage and research_dimensions:
+                try:
+                    # Translate dimensions to words
+                    dimension_labels = await self.translate_dimensions_to_words(
+                        research_dimensions, latest_coverage
+                    )
+    
+                    # Sort dimensions by coverage (highest to lowest)
+                    sorted_dimensions = sorted(
+                        dimension_labels, key=lambda x: x.get("coverage", 0), reverse=True
+                    )
+    
+                    # Display dimensions without coverage percentages
+                    for dim in sorted_dimensions[:10]:  # Limit to top 10
+                        await self.emit_message(f"- {dim.get('words', 'Dimension')}\n")
+    
+                    await self.emit_message("\n")
+                except Exception as e:
+                    logger.error(f"Error displaying final dimension coverage: {e}")
+                    await self.emit_message("*Error displaying research dimensions*\n\n")
+            else:
+                logger.warning("No research dimensions data available for display")
+                await self.emit_message("*No research dimension data available*\n\n")
+    
+            # Determine which model to use for synthesis
+            synthesis_model = self.get_synthesis_model()
+            await self.emit_synthesis_status(
+                f"Using {synthesis_model} for section generation..."
+            )
+    
+            # Clear section content storage
+            self.update_state("section_synthesized_content", {})
+            self.update_state("subtopic_synthesized_content", {})
+            self.update_state("section_sources_map", {})
+            self.update_state("section_citations", {})
+    
+            # Initialize global citation map if not exists
+            if "global_citation_map" not in state:
+                self.update_state("global_citation_map", {})
+    
+            # Process each main topic and its subtopics
+            compiled_sections = {}
+    
+            # Include only main topics that are not in irrelevant_topics
             relevant_topics = [
-                {"topic": "Research Summary", "subtopics": ["General Information"]}
+                topic
+                for topic in synthesis_outline
+                if topic["topic"] not in irrelevant_topics
             ]
-
-        # Initialize _seen_sections and _seen_subtopics attributes
-        self._seen_sections = set()
-        self._seen_subtopics = set()
-
-        # Generate content for each section with proper status updates
-        all_verified_citations = []
-        all_flagged_citations = []
-
-        for topic_item in relevant_topics:
-            section_title = topic_item["topic"]
-            subtopics = [
-                st
-                for st in topic_item.get("subtopics", [])
-                if st not in irrelevant_topics
-            ]
-
-            # Generate content for this section with inline citations (subtopic-based)
-            section_data = await self.generate_section_content_with_citations(
-                section_title,
-                subtopics,
-                user_message,
-                results_history,
-                synthesis_model,
-                is_follow_up,
-                state.get("prev_comprehensive_summary", "") if is_follow_up else "",
-            )
-
-            # Store in compiled sections
-            compiled_sections[section_title] = section_data["content"]
-
-            # Track citations for bibliography generation
-            if "verified_citations" in section_data:
-                all_verified_citations.extend(
-                    section_data.get("verified_citations", [])
+    
+            # If we have no relevant topics, use a simple structure
+            if not relevant_topics:
+                relevant_topics = [
+                    {"topic": "Research Summary", "subtopics": ["General Information"]}
+                ]
+    
+            # Initialize _seen_sections and _seen_subtopics attributes
+            self._seen_sections = set()
+            self._seen_subtopics = set()
+    
+            # Generate content for each section with proper status updates
+            all_verified_citations = []
+            all_flagged_citations = []
+    
+            for topic_item in relevant_topics:
+                section_title = topic_item["topic"]
+                subtopics = [
+                    st
+                    for st in topic_item.get("subtopics", [])
+                    if st not in irrelevant_topics
+                ]
+    
+                # Generate content for this section with inline citations (subtopic-based)
+                section_data = await self.generate_section_content_with_citations(
+                    section_title,
+                    subtopics,
+                    user_message,
+                    results_history,
+                    synthesis_model,
+                    is_follow_up,
+                    state.get("prev_comprehensive_summary", "") if is_follow_up else "",
                 )
-            if "flagged_citations" in section_data:
-                all_flagged_citations.extend(section_data.get("flagged_citations", []))
-
-        # Store verification results for later use
-        verification_results = {
-            "verified": all_verified_citations,
-            "flagged": all_flagged_citations,
-        }
-        self.update_state("verification_results", verification_results)
-
-        # Process any non-standard citations that might still be in the text
-        await self.emit_synthesis_status("Processing additional citation formats...")
-        additional_citations = []
-        master_source_table = state.get("master_source_table", {})
-        global_citation_map = state.get("global_citation_map", {})
-
-        for section_title, content in compiled_sections.items():
-            # Use existing method to find non-standard citations
-            section_citations = await self.identify_and_correlate_citations(
-                section_title, content, master_source_table
+    
+                # Store in compiled sections
+                compiled_sections[section_title] = section_data["content"]
+    
+                # Track citations for bibliography generation
+                if "verified_citations" in section_data:
+                    all_verified_citations.extend(
+                        section_data.get("verified_citations", [])
+                    )
+                if "flagged_citations" in section_data:
+                    all_flagged_citations.extend(section_data.get("flagged_citations", []))
+    
+            # Store verification results for later use
+            verification_results = {
+                "verified": all_verified_citations,
+                "flagged": all_flagged_citations,
+            }
+            self.update_state("verification_results", verification_results)
+    
+            # Process any non-standard citations that might still be in the text
+            await self.emit_synthesis_status("Processing additional citation formats...")
+            additional_citations = []
+            master_source_table = state.get("master_source_table", {})
+            global_citation_map = state.get("global_citation_map", {})
+    
+            for section_title, content in compiled_sections.items():
+                # Use existing method to find non-standard citations
+                section_citations = await self.identify_and_correlate_citations(
+                    section_title, content, master_source_table
+                )
+    
+                if section_citations:
+                    # Add these citations to our tracking
+                    additional_citations.extend(section_citations)
+    
+                    # Add to section citations tracking
+                    all_section_citations = state.get("section_citations", {})
+                    if section_title not in all_section_citations:
+                        all_section_citations[section_title] = []
+                    all_section_citations[section_title].extend(section_citations)
+                    self.update_state("section_citations", all_section_citations)
+    
+                    # Add URLs to global citation map
+                    for citation in section_citations:
+                        url = citation.get("url", "")
+                        if url and url not in global_citation_map:
+                            global_citation_map[url] = len(global_citation_map) + 1
+    
+            # Update global citation map with any new URLs found
+            self.update_state("global_citation_map", global_citation_map)
+    
+            # Generate bibliography from citation data
+            await self.emit_synthesis_status("Generating bibliography...")
+            bibliography_data = await self.generate_bibliography(
+                master_source_table, global_citation_map
             )
-
-            if section_citations:
-                # Add these citations to our tracking
-                additional_citations.extend(section_citations)
-
-                # Add to section citations tracking
-                all_section_citations = state.get("section_citations", {})
-                if section_title not in all_section_citations:
-                    all_section_citations[section_title] = []
-                all_section_citations[section_title].extend(section_citations)
-                self.update_state("section_citations", all_section_citations)
-
-                # Add URLs to global citation map
+    
+            # Final pass to handle non-standard citations and apply strikethrough
+            await self.emit_synthesis_status("Finalizing citation formatting...")
+            for section_title, content in list(compiled_sections.items()):
+                modified_content = content
+    
+                # Handle only non-standard citations (numeric ones were already processed)
+                section_citations = [
+                    c for c in additional_citations if c.get("section") == section_title
+                ]
+    
                 for citation in section_citations:
                     url = citation.get("url", "")
-                    if url and url not in global_citation_map:
-                        global_citation_map[url] = len(global_citation_map) + 1
+                    raw_text = citation.get("raw_text", "")
+    
+                    if url and url in global_citation_map and raw_text:
+                        global_id = global_citation_map[url]
+                        # Replace the original citation text with the global ID
+                        modified_content = modified_content.replace(
+                            raw_text, f"[{global_id}]"
+                        )
+    
+                # Update the original section content
+                compiled_sections[section_title] = modified_content
+    
+            # Generate titles for the report
+            await self.emit_synthesis_status("Generating report titles...")
+            titles = await self.generate_titles(
+                user_message, "".join(compiled_sections.values())
+            )
+    
+            # After all sections are generated, perform synthesis review
+            await self.emit_synthesis_status("Reviewing and improving the synthesis...")
+    
+            # Get synthesis review
+            review_data = await self.review_synthesis(
+                compiled_sections, user_message, synthesis_outline, synthesis_model
+            )
+    
+            # Apply edits from review
+            await self.emit_synthesis_status("Applying improvements to synthesis...")
+            edited_sections, changes_made = await self.apply_review_edits(
+                compiled_sections, review_data, synthesis_model
+            )
+    
+            # Format the bibliography
+            bibliography_table = await self.format_bibliography_list(
+                bibliography_data["bibliography"]
+            )
+    
+            # Generate abstract
+            await self.emit_synthesis_status("Generating abstract...")
+            abstract = await self.generate_abstract(
+                user_message,
+                "".join(edited_sections.values()),
+                bibliography_data["bibliography"],
+            )
+    
+            # Build final answer
+            comprehensive_answer = ""
+    
+            # Add title and subtitle
+            main_title = titles.get("main_title", f"Research Report: {user_message}")
+            subtitle = titles.get("subtitle", "A Comprehensive Analysis and Synthesis")
+    
+            comprehensive_answer += f"# {main_title}\n\n## {subtitle}\n\n"
+    
+            # Add abstract
+            comprehensive_answer += f"## Abstract\n\n{abstract}\n\n"
+    
+            # Add introduction with compression
+            await self.emit_synthesis_status("Generating introduction...")
+            intro_prompt = {
+                "role": "system",
+                "content": f"""You are a post-grad research assistant writing an introduction for a research report in response to this query: "{user_message}".
+                    Create a concise introduction (2-3 paragraphs) that summarizes the purpose of the research and sets the stage for the report content.
+    
+                	The introduction should:
+                    1. Set the stage for the subject matter and orient the reader toward what's to come.
+                	2. Introduce the research objective and original intent without simply restating the original query.
+                	3. Describe key details or aspects of the subject matter to be explored in the report.
+                
+                    The introduction must NOT:
+                    1. Interpret the content in a lofty way that exaggerates its importance or profundity, or contrives a narrative with empty sophistication. 
+                    2. Attempt to portray the subject matter in any particular sort of light, good or bad, especially by using apologetic or dismissive language.
+                    3. Focus on perceived complexities or challenges related to the topic or research process, or include appeals to future research.
+                    
+                    The introduction should establish the context of the original query, state the research question, and briefly outline the approach taken to answering it. 
+                    Do not add your own bias or sentiment to the introduction. Do not include general statements about the research process itself.
+                    Please only respond with your introduction - do not include any segue, commentary, explanation, etc.""",
+            }
+    
+            intro_context = f"Research Query: {user_message}\n\nResearch Outline:"
+            for section in edited_sections:
+                intro_context += f"\n- {section}"
+    
+            # Add compressed section content for better context
+            section_context = "\n\nSection Content Summary:\n"
+            for section_title, content in edited_sections.items():
+                section_context += f"\n{section_title}: {content}...\n"
+    
+            # Compress the combined context
+            combined_intro_context = intro_context + section_context
+            intro_embedding = await self.get_embedding(combined_intro_context)
+            compressed_intro_context = await self.compress_content_with_eigendecomposition(
+                combined_intro_context, intro_embedding, None, None
+            )
+    
+            intro_message = {"role": "user", "content": compressed_intro_context}
+    
+            try:
+                # Use synthesis model for intro
+                intro_response = await self.generate_completion(
+                    synthesis_model,
+                    [intro_prompt, intro_message],
+                    stream=False,
+                    temperature=self.valves.SYNTHESIS_TEMPERATURE * 0.83,
+                    user_facing=True,
+                )
+    
+                if (
+                    intro_response
+                    and "choices" in intro_response
+                    and len(intro_response["choices"]) > 0
+                ):
+                    introduction = intro_response["choices"][0]["message"]["content"]
+                    comprehensive_answer += f"## Introduction\n\n{introduction}\n\n"
+                    await self.emit_synthesis_status("Introduction generation complete")
+            except Exception as e:
+                logger.error(f"Error generating introduction: {e}")
+                comprehensive_answer += f"## Introduction\n\nThis research report addresses the query: '{user_message}'. The following sections present findings from a comprehensive investigation of this topic.\n\n"
+                await self.emit_synthesis_status(
+                    "Introduction generation failed, using fallback"
+                )
+    
+            # Add each section with heading
+            for section_title, content in edited_sections.items():
+                # Get token count for the section
+                memory_stats = state.get("memory_stats", {})
+                section_tokens = memory_stats.get("section_tokens", {})
+                section_tokens_count = section_tokens.get(section_title, 0)
+                if section_tokens_count == 0:
+                    section_tokens_count = await self.count_tokens(content)
+                    section_tokens[section_title] = section_tokens_count
+                    memory_stats["section_tokens"] = section_tokens
+                    self.update_state("memory_stats", memory_stats)
+    
+                # Check for section title duplication in various formats
+                if (
+                    content.startswith(section_title)
+                    or content.startswith(f"# {section_title}")
+                    or content.startswith(f"## {section_title}")
+                ):
+                    # Remove first line and any following whitespace
+                    content = (
+                        content.split("\n", 1)[1].lstrip() if "\n" in content else content
+                    )
+    
+                comprehensive_answer += f"## {section_title}\n\n{content}\n\n"
+    
+            # Add conclusion with compression
+            await self.emit_synthesis_status("Generating conclusion...")
+            concl_prompt = {
+                "role": "system",
+                "content": f"""You are a post-grad research assistant writing a comprehensive conclusion for a research report in response to this query: "{user_message}".
+                    Create a concise conclusion (2-4 paragraphs) that synthesizes the key findings and insights from the research.
+                    
+                    The conclusion should:
+                	1. Restate the research objective and original intent from what has become a more knowing and researched standpoint.
+                	2. Highlight the most important research discoveries and their significance to the original topic and user query.
+                    3. Focus on the big picture characterizing the research and topic as a whole, using researched factual content as support.
+                    4. Definitively address the subject matter, focusing on what we know about it rather than what we don't.
+                    5. Acknowledge significant tangents in research, but ultimately remain focused on the original topic and user query.
+                
+                    The conclusion must NOT:
+                    1. Interpret the content in a lofty way that exaggerates its importance or profundity, or contrives a narrative with empty sophistication. 
+                    2. Attempt to portray the subject matter in any particular sort of light, good or bad, especially by using apologetic or dismissive language.
+                    3. Focus on perceived complexities or challenges related to the topic or research process, or include appeals to future research.
+                    4. Ever take a preachy or moralizing tone, or take a "stance" for or against/"side" with or against anything not driven by the provided data.
+                    5. Overstate the significance of specific services, providers, locations, brands, or other entities beyond examples of some type or category.
+                    6. Sound to the reader as though it is overtly attempting to be diplomatic, considerate, enthusiastic, or overly-generalized.
+        
+                    Please only respond with your conclusion - do not include any segue, commentary, explanation, etc.""",
+            }
+    
+            concl_context = (
+                f"Research Query: {user_message}\n\nKey findings from each section:\n"
+            )
+    
+            # Use compression for each section based on the model's context window
+            full_content = ""
+            for section_title, content in edited_sections.items():
+                full_content += f"\n## {section_title}\n{content}\n\n"
+    
+            # Get embedding for compression context
+            content_embedding = await self.get_embedding(full_content[:2000])
+    
+            # Apply intelligent compression based on your existing logic
+            compressed_content = await self.compress_content_with_eigendecomposition(
+                full_content,
+                content_embedding,
+                None,  # No summary embedding needed
+                None,  # Let the compression function decide the ratio based on content
+            )
+    
+            concl_context += compressed_content
+    
+            concl_message = {"role": "user", "content": concl_context}
+    
+            try:
+                # Use synthesis model for conclusion
+                concl_response = await self.generate_completion(
+                    synthesis_model,
+                    [concl_prompt, concl_message],
+                    stream=False,
+                    temperature=self.valves.SYNTHESIS_TEMPERATURE,
+                    user_facing=True,
+                )
+    
+                if (
+                    concl_response
+                    and "choices" in concl_response
+                    and len(concl_response["choices"]) > 0
+                ):
+                    conclusion = concl_response["choices"][0]["message"]["content"]
+                    comprehensive_answer += f"## Conclusion\n\n{conclusion}\n\n"
+                    await self.emit_synthesis_status("Conclusion generation complete")
+            except Exception as e:
+                logger.error(f"Error generating conclusion: {e}")
+                await self.emit_synthesis_status(
+                    "Conclusion generation failed, using fallback"
+                )
+    
+            # Add verification note if any citations were flagged
+            comprehensive_answer = await self.add_verification_note(comprehensive_answer)
+    
+            # Add bibliography
+            comprehensive_answer += f"{bibliography_table}\n\n"
+    
+            # Add research date
+            comprehensive_answer += f"*Research conducted on: {self.research_date}*\n\n"
+    
+            # Count total tokens in the comprehensive answer
+            synthesis_tokens = await self.count_tokens(comprehensive_answer)
+            memory_stats = state.get("memory_stats", {})
+            memory_stats["synthesis_tokens"] = synthesis_tokens
+            self.update_state("memory_stats", memory_stats)
+    
+            # Calculate total tokens used in the research
+            results_tokens = memory_stats.get("results_tokens", 0)
+            section_tokens_sum = sum(memory_stats.get("section_tokens", {}).values())
+            total_tokens = results_tokens + section_tokens_sum + synthesis_tokens
+            memory_stats["total_tokens"] = total_tokens
+            self.update_state("memory_stats", memory_stats)
 
-        # Update global citation map with any new URLs found
-        self.update_state("global_citation_map", global_citation_map)
+            # Mark research as completed
+            self.update_state("research_completed", True)
+            research_finished = True
 
-        # Generate bibliography from citation data
-        await self.emit_synthesis_status("Generating bibliography...")
-        bibliography_data = await self.generate_bibliography(
-            master_source_table, global_citation_map
-        )
-
-        # Final pass to handle non-standard citations and apply strikethrough
-        await self.emit_synthesis_status("Finalizing citation formatting...")
-        for section_title, content in list(compiled_sections.items()):
-            modified_content = content
-
-            # Handle only non-standard citations (numeric ones were already processed)
-            section_citations = [
-                c for c in additional_citations if c.get("section") == section_title
-            ]
-
-            for citation in section_citations:
-                url = citation.get("url", "")
-                raw_text = citation.get("raw_text", "")
-
-                if url and url in global_citation_map and raw_text:
-                    global_id = global_citation_map[url]
-                    # Replace the original citation text with the global ID
-                    modified_content = modified_content.replace(
-                        raw_text, f"[{global_id}]"
+            # Output the final compiled and edited synthesis
+            await self.emit_synthesis_status("Final synthesis complete!", True)
+    
+            # Output the complete integrated synthesis
+            await self.emit_message("\n\n## Comprehensive Answer\n\n")
+            await self.emit_message(comprehensive_answer)
+    
+            # Add token usage statistics
+            token_stats = (
+                f"\n\n---\n\n**Token Usage Statistics**\n\n"
+                f"- Research Results: {results_tokens} tokens\n"
+                f"- Final Synthesis: {synthesis_tokens} tokens\n"
+                f"- Total: {total_tokens} tokens\n"
+            )
+            await self.emit_message(token_stats)
+    
+            # Store the comprehensive answer for potential follow-up queries
+            self.update_state("prev_comprehensive_summary", comprehensive_answer)
+    
+            # Share embedding cache stats
+            cache_stats = self.embedding_cache.stats()
+            logger.info(f"Embedding cache stats: {cache_stats}")
+    
+            # Export research data if enabled
+            if self.valves.EXPORT_RESEARCH_DATA:
+                try:
+                    await self.emit_status("info", "Exporting research data...", False)
+                    export_result = await self.export_research_data()
+    
+                    # Output information about where the export was saved
+                    txt_filepath = export_result.get("txt_filepath", "")
+                    # json_filepath = export_result.get("json_filepath", "")
+    
+                    export_message = (
+                        f"\n\n---\n\n**Research Data Exported**\n\n"
+                        f"Research data has been exported to:\n"
+                        f"- Text file: `{txt_filepath}`\n\n"
+                        f"This file contain all research results, queries, timestamps, and content for future reference."
+                    )
+    
+                    await self.emit_message(export_message)
+    
+                except Exception as e:
+                    logger.error(f"Error exporting research data: {e}")
+                    await self.emit_message(
+                        "*There was an error exporting the research data.*\n"
                     )
 
-            # Update the original section content
-            compiled_sections[section_title] = modified_content
+            # Complete the process
+            await self.emit_status("success", "Deep research complete!", True)
+            await self._cleanup_conversation_resources(conversation_id)
+            cleanup_done = True
+            return ""
 
-        # Generate titles for the report
-        await self.emit_synthesis_status("Generating report titles...")
-        titles = await self.generate_titles(
-            user_message, "".join(compiled_sections.values())
-        )
-
-        # After all sections are generated, perform synthesis review
-        await self.emit_synthesis_status("Reviewing and improving the synthesis...")
-
-        # Get synthesis review
-        review_data = await self.review_synthesis(
-            compiled_sections, user_message, synthesis_outline, synthesis_model
-        )
-
-        # Apply edits from review
-        await self.emit_synthesis_status("Applying improvements to synthesis...")
-        edited_sections, changes_made = await self.apply_review_edits(
-            compiled_sections, review_data, synthesis_model
-        )
-
-        # Format the bibliography
-        bibliography_table = await self.format_bibliography_list(
-            bibliography_data["bibliography"]
-        )
-
-        # Generate abstract
-        await self.emit_synthesis_status("Generating abstract...")
-        abstract = await self.generate_abstract(
-            user_message,
-            "".join(edited_sections.values()),
-            bibliography_data["bibliography"],
-        )
-
-        # Build final answer
-        comprehensive_answer = ""
-
-        # Add title and subtitle
-        main_title = titles.get("main_title", f"Research Report: {user_message}")
-        subtitle = titles.get("subtitle", "A Comprehensive Analysis and Synthesis")
-
-        comprehensive_answer += f"# {main_title}\n\n## {subtitle}\n\n"
-
-        # Add abstract
-        comprehensive_answer += f"## Abstract\n\n{abstract}\n\n"
-
-        # Add introduction with compression
-        await self.emit_synthesis_status("Generating introduction...")
-        intro_prompt = {
-            "role": "system",
-            "content": f"""You are a post-grad research assistant writing an introduction for a research report in response to this query: "{user_message}".
-                Create a concise introduction (2-3 paragraphs) that summarizes the purpose of the research and sets the stage for the report content.
-
-            	The introduction should:
-                1. Set the stage for the subject matter and orient the reader toward what's to come.
-            	2. Introduce the research objective and original intent without simply restating the original query.
-            	3. Describe key details or aspects of the subject matter to be explored in the report.
-            
-                The introduction must NOT:
-                1. Interpret the content in a lofty way that exaggerates its importance or profundity, or contrives a narrative with empty sophistication. 
-                2. Attempt to portray the subject matter in any particular sort of light, good or bad, especially by using apologetic or dismissive language.
-                3. Focus on perceived complexities or challenges related to the topic or research process, or include appeals to future research.
-                
-                The introduction should establish the context of the original query, state the research question, and briefly outline the approach taken to answering it. 
-                Do not add your own bias or sentiment to the introduction. Do not include general statements about the research process itself.
-                Please only respond with your introduction - do not include any segue, commentary, explanation, etc.""",
-        }
-
-        intro_context = f"Research Query: {user_message}\n\nResearch Outline:"
-        for section in edited_sections:
-            intro_context += f"\n- {section}"
-
-        # Add compressed section content for better context
-        section_context = "\n\nSection Content Summary:\n"
-        for section_title, content in edited_sections.items():
-            section_context += f"\n{section_title}: {content}...\n"
-
-        # Compress the combined context
-        combined_intro_context = intro_context + section_context
-        intro_embedding = await self.get_embedding(combined_intro_context)
-        compressed_intro_context = await self.compress_content_with_eigendecomposition(
-            combined_intro_context, intro_embedding, None, None
-        )
-
-        intro_message = {"role": "user", "content": compressed_intro_context}
-
-        try:
-            # Use synthesis model for intro
-            intro_response = await self.generate_completion(
-                synthesis_model,
-                [intro_prompt, intro_message],
-                stream=False,
-                temperature=self.valves.SYNTHESIS_TEMPERATURE * 0.83,
-                user_facing=True,
-            )
-
-            if (
-                intro_response
-                and "choices" in intro_response
-                and len(intro_response["choices"]) > 0
-            ):
-                introduction = intro_response["choices"][0]["message"]["content"]
-                comprehensive_answer += f"## Introduction\n\n{introduction}\n\n"
-                await self.emit_synthesis_status("Introduction generation complete")
-        except Exception as e:
-            logger.error(f"Error generating introduction: {e}")
-            comprehensive_answer += f"## Introduction\n\nThis research report addresses the query: '{user_message}'. The following sections present findings from a comprehensive investigation of this topic.\n\n"
-            await self.emit_synthesis_status(
-                "Introduction generation failed, using fallback"
-            )
-
-        # Add each section with heading
-        for section_title, content in edited_sections.items():
-            # Get token count for the section
-            memory_stats = state.get("memory_stats", {})
-            section_tokens = memory_stats.get("section_tokens", {})
-            section_tokens_count = section_tokens.get(section_title, 0)
-            if section_tokens_count == 0:
-                section_tokens_count = await self.count_tokens(content)
-                section_tokens[section_title] = section_tokens_count
-                memory_stats["section_tokens"] = section_tokens
-                self.update_state("memory_stats", memory_stats)
-
-            # Check for section title duplication in various formats
-            if (
-                content.startswith(section_title)
-                or content.startswith(f"# {section_title}")
-                or content.startswith(f"## {section_title}")
-            ):
-                # Remove first line and any following whitespace
-                content = (
-                    content.split("\n", 1)[1].lstrip() if "\n" in content else content
-                )
-
-            comprehensive_answer += f"## {section_title}\n\n{content}\n\n"
-
-        # Add conclusion with compression
-        await self.emit_synthesis_status("Generating conclusion...")
-        concl_prompt = {
-            "role": "system",
-            "content": f"""You are a post-grad research assistant writing a comprehensive conclusion for a research report in response to this query: "{user_message}".
-                Create a concise conclusion (2-4 paragraphs) that synthesizes the key findings and insights from the research.
-                
-                The conclusion should:
-            	1. Restate the research objective and original intent from what has become a more knowing and researched standpoint.
-            	2. Highlight the most important research discoveries and their significance to the original topic and user query.
-                3. Focus on the big picture characterizing the research and topic as a whole, using researched factual content as support.
-                4. Definitively address the subject matter, focusing on what we know about it rather than what we don't.
-                5. Acknowledge significant tangents in research, but ultimately remain focused on the original topic and user query.
-            
-                The conclusion must NOT:
-                1. Interpret the content in a lofty way that exaggerates its importance or profundity, or contrives a narrative with empty sophistication. 
-                2. Attempt to portray the subject matter in any particular sort of light, good or bad, especially by using apologetic or dismissive language.
-                3. Focus on perceived complexities or challenges related to the topic or research process, or include appeals to future research.
-                4. Ever take a preachy or moralizing tone, or take a "stance" for or against/"side" with or against anything not driven by the provided data.
-                5. Overstate the significance of specific services, providers, locations, brands, or other entities beyond examples of some type or category.
-                6. Sound to the reader as though it is overtly attempting to be diplomatic, considerate, enthusiastic, or overly-generalized.
-    
-                Please only respond with your conclusion - do not include any segue, commentary, explanation, etc.""",
-        }
-
-        concl_context = (
-            f"Research Query: {user_message}\n\nKey findings from each section:\n"
-        )
-
-        # Use compression for each section based on the model's context window
-        full_content = ""
-        for section_title, content in edited_sections.items():
-            full_content += f"\n## {section_title}\n{content}\n\n"
-
-        # Get embedding for compression context
-        content_embedding = await self.get_embedding(full_content[:2000])
-
-        # Apply intelligent compression based on your existing logic
-        compressed_content = await self.compress_content_with_eigendecomposition(
-            full_content,
-            content_embedding,
-            None,  # No summary embedding needed
-            None,  # Let the compression function decide the ratio based on content
-        )
-
-        concl_context += compressed_content
-
-        concl_message = {"role": "user", "content": concl_context}
-
-        try:
-            # Use synthesis model for conclusion
-            concl_response = await self.generate_completion(
-                synthesis_model,
-                [concl_prompt, concl_message],
-                stream=False,
-                temperature=self.valves.SYNTHESIS_TEMPERATURE,
-                user_facing=True,
-            )
-
-            if (
-                concl_response
-                and "choices" in concl_response
-                and len(concl_response["choices"]) > 0
-            ):
-                conclusion = concl_response["choices"][0]["message"]["content"]
-                comprehensive_answer += f"## Conclusion\n\n{conclusion}\n\n"
-                await self.emit_synthesis_status("Conclusion generation complete")
-        except Exception as e:
-            logger.error(f"Error generating conclusion: {e}")
-            await self.emit_synthesis_status(
-                "Conclusion generation failed, using fallback"
-            )
-
-        # Add verification note if any citations were flagged
-        comprehensive_answer = await self.add_verification_note(comprehensive_answer)
-
-        # Add bibliography
-        comprehensive_answer += f"{bibliography_table}\n\n"
-
-        # Add research date
-        comprehensive_answer += f"*Research conducted on: {self.research_date}*\n\n"
-
-        # Count total tokens in the comprehensive answer
-        synthesis_tokens = await self.count_tokens(comprehensive_answer)
-        memory_stats = state.get("memory_stats", {})
-        memory_stats["synthesis_tokens"] = synthesis_tokens
-        self.update_state("memory_stats", memory_stats)
-
-        # Calculate total tokens used in the research
-        results_tokens = memory_stats.get("results_tokens", 0)
-        section_tokens_sum = sum(memory_stats.get("section_tokens", {}).values())
-        total_tokens = results_tokens + section_tokens_sum + synthesis_tokens
-        memory_stats["total_tokens"] = total_tokens
-        self.update_state("memory_stats", memory_stats)
-
-        # Mark research as completed
-        self.update_state("research_completed", True)
-
-        # Output the final compiled and edited synthesis
-        await self.emit_synthesis_status("Final synthesis complete!", True)
-
-        # Output the complete integrated synthesis
-        await self.emit_message("\n\n## Comprehensive Answer\n\n")
-        await self.emit_message(comprehensive_answer)
-
-        # Add token usage statistics
-        token_stats = (
-            f"\n\n---\n\n**Token Usage Statistics**\n\n"
-            f"- Research Results: {results_tokens} tokens\n"
-            f"- Final Synthesis: {synthesis_tokens} tokens\n"
-            f"- Total: {total_tokens} tokens\n"
-        )
-        await self.emit_message(token_stats)
-
-        # Store the comprehensive answer for potential follow-up queries
-        self.update_state("prev_comprehensive_summary", comprehensive_answer)
-
-        # Share embedding cache stats
-        cache_stats = self.embedding_cache.stats()
-        logger.info(f"Embedding cache stats: {cache_stats}")
-
-        # Export research data if enabled
-        if self.valves.EXPORT_RESEARCH_DATA:
-            try:
-                await self.emit_status("info", "Exporting research data...", False)
-                export_result = await self.export_research_data()
-
-                # Output information about where the export was saved
-                txt_filepath = export_result.get("txt_filepath", "")
-                # json_filepath = export_result.get("json_filepath", "")
-
-                export_message = (
-                    f"\n\n---\n\n**Research Data Exported**\n\n"
-                    f"Research data has been exported to:\n"
-                    f"- Text file: `{txt_filepath}`\n\n"
-                    f"This file contain all research results, queries, timestamps, and content for future reference."
-                )
-
-                await self.emit_message(export_message)
-
-            except Exception as e:
-                logger.error(f"Error exporting research data: {e}")
-                await self.emit_message(
-                    "*There was an error exporting the research data.*\n"
-                )
-
-        # Complete the process
-        await self.emit_status("success", "Deep research complete!", True)
-        return ""
+        finally:
+            if research_finished and not cleanup_done:
+                await self._cleanup_conversation_resources(conversation_id)
+                cleanup_done = True
+            if not cleanup_done:
+                await self._release_conversation_slot(conversation_id)
 
 
 class TrajectoryAccumulator:
