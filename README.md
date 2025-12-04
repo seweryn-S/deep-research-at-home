@@ -1,5 +1,6 @@
 Distributed under the Apache-2.0 License. See LICENSE for details.
 
+- Wersja 0.2.3: przebudowane cytowania i bibliografia w sekcji „Comprehensive Answer” – spójne mapowanie numerów `[n]` na źródła, zamiana cytatów w treści na przypisy Markdown (`[^n]` → `[^n]: ...`), usunięcie surowych znaczników HTML i nadmiarowych list źródeł generowanych przez model.
 - Wersja 0.2.2: poprawiona normalizacja odpowiedzi modeli rozumujących – strumieniowe pola `reasoning_content` są buforowane osobno i nie są już doklejane do `content`, co zapobiega wyciekowi wewnętrznych instrukcji do sekcji „Comprehensive Answer”; w razie braku `content` używany jest `reasoning_content` jako bezpieczny fallback.
 - Wersja 0.2.1: limit równoległych sesji konfigurowalny (`PARALLEL_SESSIONS`, domyślnie 2) z licznikami w komunikatach; per-sesyjny executor wątków i sprzątanie stanu (w tym `url_results_cache`) po zakończeniu badań, żeby nie trzymać pamięci między rozmowami.
 - Wersja 0.2.0: wycięty słownik MIT/prebuildy embeddingów; etykiety preferencji (PDV) tworzy lokalny LLM na podstawie wybranych tematów; dodany `DEBUG_LLM` do logowania zapytań/odpowiedzi oraz parsowanie strumieni `data:` do pełnego tekstu; wymuszanie języka na wyjściach user-facing (`OUTPUT_LANGUAGE`).

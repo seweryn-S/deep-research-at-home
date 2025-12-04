@@ -1,6 +1,6 @@
 # Original work by GitHub user atineiatte (2024)
 # Modifications by Seweryn Sitarski (2025)
-# Version: 0.2.2
+# Version: 0.2.3
 
 # Licensed under the Apache License, Version 2.0 (the "License");
 # You may not use this file except in compliance with the License.
@@ -7880,9 +7880,10 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
         4. Ever take a preachy or moralizing tone, or take a "stance" for or against/"side" with or against anything not driven by the provided data.
         5. Overstate the significance of specific services, providers, locations, brands, or other entities beyond examples of some type or category.
         6. Sound to the reader as though it is overtly attempting to be diplomatic, considerate, enthusiastic, or overly-generalized.
+        7. Include any explicit "Sources", "References", or "Bibliography" section or list of URLs at the end of the subsection. All referencing must remain inline via numerical citations only.
     
         You must accurately cite your sources to avoid plagiarizing. Citations MUST be numerical and correspond to the correct source ID in the provided list.
-        Do not combine multiple IDs in one citation tag. Please respond with just the subsection body, no intro or title.""",
+        Do not combine multiple IDs in one citation tag. Do NOT add a separate source list or bibliography at the end of the subsection. Please respond with just the subsection body, no intro or title.""",
         }
 
         # Create a combined embedding for query + subtopic with state-level caching
@@ -8599,8 +8600,15 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
             # Return original content on error
             return combined_content
 
-    async def generate_bibliography(self, master_source_table, global_citation_map):
-        """Generate a bibliography using sequential numbering based on actual citations in the report"""
+    async def generate_bibliography(
+        self, master_source_table, global_citation_map, compiled_sections=None
+    ):
+        """Generate a bibliography using sequential numbering based on actual citations in the report.
+
+        compiled_sections:
+            Optional mapping {section_title: text}. If omitted, falls back to
+            the latest section_synthesized_content stored in state.
+        """
         if not master_source_table:
             return {
                 "bibliography": [],
@@ -8609,8 +8617,9 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
             }
 
         # First, scan all compiled sections to find actually cited sources
-        state = self.get_state()
-        compiled_sections = state.get("section_synthesized_content", {})
+        if compiled_sections is None:
+            state = self.get_state()
+            compiled_sections = state.get("section_synthesized_content", {})
 
         # Extract all citation numbers from the compiled text
         cited_numbers = set()
@@ -8672,11 +8681,16 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
         }
 
     async def format_bibliography_list(self, bibliography):
-        """Format the bibliography as a numbered list"""
+        """Format the bibliography as Markdown footnotes.
+
+        Each entry is rendered as:
+            [^n]: Title. [url](url)
+        so that in-text citations like [^n] are resolved correctly by Markdown renderers.
+        """
         if not bibliography:
             return "No sources were referenced in this research."
 
-        # Create numbered list format
+        # Create bibliography header
         bib_list = "\n\n## Bibliography\n\n"
 
         # Add each bibliography entry
@@ -8691,7 +8705,9 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
             else:
                 url_formatted = url
 
-            bib_list += f"[{citation_id}] {title}. {url_formatted}\n\n"
+            # Use standard Markdown footnote definition, e.g.:
+            # [^1]: Title. [url](url)
+            bib_list += f"[^{citation_id}]: {title}. {url_formatted}\n\n"
 
         return bib_list
 
@@ -8857,46 +8873,61 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
         compiled_sections = state.get("section_synthesized_content", {})
         numeric_citations_by_url = {}
 
+        # Build inverse map: global_id -> url for quick lookup
+        global_id_to_url = {gid: url for url, gid in global_citation_map.items()}
+
         # Extract all numeric citations directly from content
         for section, section_content in compiled_sections.items():
             numeric_matches = re.findall(r"\[(\d+)\]", section_content)
             for num in set(numeric_matches):
                 try:
                     numeric_id = int(num)
-                    # Find URL for this citation number in master_source_table
-                    for url, source_data in master_source_table.items():
-                        source_id = source_data.get("id", "")
-                        # Check if this source ID matches the numeric citation
-                        if source_id == f"S{numeric_id}" or source_id == str(
-                            numeric_id
-                        ):
-                            # Add to global citation map if not already there
-                            if url not in global_citation_map:
-                                global_citation_map[url] = len(global_citation_map) + 1
 
-                            # Create tracking for this citation
-                            if url not in numeric_citations_by_url:
-                                numeric_citations_by_url[url] = []
+                    url = global_id_to_url.get(numeric_id)
 
-                            # Find citation context for context checking
-                            pattern = (
-                                r"([^.!?]*\["
-                                + re.escape(str(numeric_id))
-                                + r"\][^.!?]*[.!?])"
-                            )
-                            context_matches = re.findall(pattern, section_content)
-                            for context in context_matches:
-                                numeric_citations_by_url[url].append(
-                                    {
-                                        "marker": str(numeric_id),
-                                        "raw_text": f"[{numeric_id}]",
-                                        "text": context,
-                                        "url": url,
-                                        "section": section,
-                                        "global_id": global_citation_map[url],
-                                    }
-                                )
-                            break
+                    # Fallback for any legacy cases where numeric IDs might
+                    # still be tied to master_source_table IDs rather than
+                    # global_citation_map
+                    if not url:
+                        for candidate_url, source_data in master_source_table.items():
+                            source_id = source_data.get("id", "")
+                            if source_id == f"S{numeric_id}" or source_id == str(
+                                numeric_id
+                            ):
+                                url = candidate_url
+                                # Ensure this URL has a global ID
+                                if url not in global_citation_map:
+                                    global_citation_map[url] = (
+                                        len(global_citation_map) + 1
+                                    )
+                                global_id_to_url[global_citation_map[url]] = url
+                                break
+
+                    if not url:
+                        continue
+
+                    # Create tracking for this citation
+                    if url not in numeric_citations_by_url:
+                        numeric_citations_by_url[url] = []
+
+                    # Find citation context for context checking
+                    pattern = (
+                        r"([^.!?]*\["
+                        + re.escape(str(numeric_id))
+                        + r"\][^.!?]*[.!?])"
+                    )
+                    context_matches = re.findall(pattern, section_content)
+                    for context in context_matches:
+                        numeric_citations_by_url[url].append(
+                            {
+                                "marker": str(numeric_id),
+                                "raw_text": f"[{numeric_id}]",
+                                "text": context,
+                                "url": url,
+                                "section": section,
+                                "global_id": global_citation_map[url],
+                            }
+                        )
                 except ValueError:
                     continue
 
@@ -9168,6 +9199,45 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
             "export_data": export_data,
             "txt_filepath": filepath,
         }
+
+    def _link_numeric_citations_in_text(self, text: str, bibliography) -> str:
+        """Convert bare numeric citations like [1] or [1, 2] into Markdown footnotes.
+
+        For known IDs (present in bibliography), [1] becomes [^1] and
+        [1, 2] becomes [^1], [^2].
+        """
+        if not text or not bibliography:
+            return text
+
+        # Build a set of known citation IDs from the bibliography
+        known_ids = {entry.get("id") for entry in bibliography if "id" in entry}
+
+        if not known_ids:
+            return text
+
+        def replace_citation_group(match: re.Match) -> str:
+            inner = match.group(1)
+            # Parse IDs separated by commas
+            parts = [p.strip() for p in inner.split(",") if p.strip()]
+            linked_parts = []
+            for part in parts:
+                if not part.isdigit():
+                    # If this isn't a pure number, keep original
+                    linked_parts.append(f"[{part}]")
+                    continue
+                cid = int(part)
+                if cid in known_ids:
+                    linked_parts.append(f"[^{cid}]")
+                else:
+                    # Unknown ID – leave as plain [n] to avoid broken links
+                    linked_parts.append(f"[{cid}]")
+
+            # Join with comma+space for readability
+            return ", ".join(linked_parts)
+
+        # Replace patterns like [1] or [1, 2, 3] where the contents
+        # are digits/commas/whitespace only, to avoid touching normal markdown links.
+        return re.sub(r"\[([\d\s,]+)\]", replace_citation_group, text)
 
     async def add_verification_note(self, comprehensive_answer):
         """Add a note about strikethrough citations if any were flagged"""
@@ -11324,35 +11394,44 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
             # Update global citation map with any new URLs found
             self.update_state("global_citation_map", global_citation_map)
     
-            # Generate bibliography from citation data
-            await self.emit_synthesis_status("Generating bibliography...")
-            bibliography_data = await self.generate_bibliography(
-                master_source_table, global_citation_map
-            )
-    
             # Final pass to handle non-standard citations and apply strikethrough
             await self.emit_synthesis_status("Finalizing citation formatting...")
             for section_title, content in list(compiled_sections.items()):
                 modified_content = content
-    
+
                 # Handle only non-standard citations (numeric ones were already processed)
                 section_citations = [
                     c for c in additional_citations if c.get("section") == section_title
                 ]
-    
+
                 for citation in section_citations:
                     url = citation.get("url", "")
                     raw_text = citation.get("raw_text", "")
-    
+
                     if url and url in global_citation_map and raw_text:
                         global_id = global_citation_map[url]
                         # Replace the original citation text with the global ID
                         modified_content = modified_content.replace(
                             raw_text, f"[{global_id}]"
                         )
-    
+
                 # Update the original section content
                 compiled_sections[section_title] = modified_content
+
+            # Sync updated compiled_sections back into section_synthesized_content
+            # so downstream consumers (e.g., bibliography, verification) see
+            # the final citation-formatted version.
+            state = self.get_state()
+            section_synthesized_content = state.get("section_synthesized_content", {})
+            for section_title, content in compiled_sections.items():
+                section_synthesized_content[section_title] = content
+            self.update_state("section_synthesized_content", section_synthesized_content)
+
+            # Generate bibliography from citation data using the finalized content
+            await self.emit_synthesis_status("Generating bibliography...")
+            bibliography_data = await self.generate_bibliography(
+                master_source_table, global_citation_map, compiled_sections
+            )
     
             # Generate titles for the report
             await self.emit_synthesis_status("Generating report titles...")
@@ -11535,9 +11614,9 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
             )
     
             concl_context += compressed_content
-    
+
             concl_message = {"role": "user", "content": concl_context}
-    
+
             try:
                 # Use synthesis model for conclusion
                 concl_response = await self.generate_completion(
@@ -11561,6 +11640,11 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
                 await self.emit_synthesis_status(
                     "Conclusion generation failed, using fallback"
                 )
+
+            # Link numeric in-text citations to bibliography anchors
+            comprehensive_answer = self._link_numeric_citations_in_text(
+                comprehensive_answer, bibliography_data["bibliography"]
+            )
     
             # Add verification note if any citations were flagged
             comprehensive_answer = await self.add_verification_note(comprehensive_answer)
