@@ -1,6 +1,6 @@
 # Original work by GitHub user atineiatte (2024)
 # Modifications by Seweryn Sitarski (2025)
-# Version: 0.2.3
+# Version: 0.3.0
 
 # Licensed under the Apache License, Version 2.0 (the "License");
 # You may not use this file except in compliance with the License.
@@ -22,6 +22,7 @@ import asyncio
 import re
 import random
 import contextvars
+from contextlib import contextmanager
 import numpy as np
 import aiohttp
 import concurrent.futures
@@ -56,6 +57,222 @@ def setup_logger():
 
 
 logger = setup_logger()
+
+
+# === Shared constants and helpers ==================================================
+
+# Single source of truth for compression ratios by level
+COMPRESSION_RATIO_MAP = {
+    1: 0.9,
+    2: 0.8,
+    3: 0.7,
+    4: 0.6,
+    5: 0.5,
+    6: 0.4,
+    7: 0.3,
+    8: 0.2,
+    9: 0.15,
+    10: 0.1,
+}
+
+# Common navigation/menu class patterns for HTML cleanup
+NAVIGATION_CLASS_PATTERNS = [
+    "menu",
+    "nav",
+    "header",
+    "footer",
+    "sidebar",
+    "dropdown",
+    "ibar",
+    "navigation",
+    "navbar",
+    "topbar",
+    "tab",
+    "toolbar",
+    "section",
+    "submenu",
+    "subnav",
+    "panel",
+    "drawer",
+    "accordion",
+    "toc",
+    "login",
+    "signin",
+    "auth",
+    "user-login",
+    "authType",
+]
+
+NUMBERED_LINE_PATTERNS = [
+    r"^\d+[\.\)\:]",
+    r"^[A-Za-z][\.\)\:]",
+    r".*\d+[\.\)\:]$",
+]
+
+PROMPTS = {
+    "titles_system": """You are a post-grad research writer creating compelling titles for research reports.
+
+Create a main title and subtitle for a comprehensive research report. The titles should:
+1. Be relevant and accurately reflect the content and focus of the research
+2. Be engaging and professional. Intriguing, even
+3. Follow academic/research paper conventions
+4. Avoid clickbait or sensationalism unless it's really begging for it
+
+For main title:
+- 5-12 words in length
+- Clear and focused
+- Appropriately formal for academic/research context
+
+For subtitle:
+- 8-15 words in length
+- Provides additional context and specificity
+- Complements the main title without redundancy
+
+Format your response as a JSON object with the following structure:
+{
+  "main_title": "Your proposed main title",
+  "subtitle": "Your proposed subtitle"
+}""",
+    "abstract_system": """You are a post-grad research assistant writing an abstract for a comprehensive research report.
+
+Create a concise academic abstract (150-250 words) that summarizes the research report. The abstract should:
+1. Outline the research objective and original intent without simply restating the original query
+2. Summarize the key findings and their significance
+3. Be written in an academic yet interesting tone
+4. Be self-contained and understandable on its own
+5. Draw you in by highlighting the interesting aspects of the research without being misleading or disingenuous
+
+The abstract must NOT:
+1. Interpret the content in a lofty way that exaggerates its importance or profundity, or contrives a narrative with empty sophistication.
+2. Attempt to portray the subject matter in any particular sort of light, good or bad, especially by using apologetic or dismissive language.
+3. Focus on perceived complexities or challenges related to the topic or research process, or include appeals to future research.
+4. Ever take a preachy or moralizing tone, or take a "stance" for or against/"side" with or against anything not driven by the provided data.
+5. Overstate the significance of specific services, providers, locations, brands, or other entities beyond examples of some type or category.
+6. Sound to the reader as though it is overtly attempting to be diplomatic, considerate, enthusiastic, or overly-generalized.
+
+The abstract should follow scientific paper abstract structure but be accessible to an educated general audience.""",
+    "section_review_system": """You are a post-grad research editor reviewing a comprehensive research report assembled per-section in different model contexts.
+Your task is to identify any issues with this combination of multiple sections and the flow between them.
+
+Focus on:
+1. Identifying areas needing better transitions between sections
+2. Finding obvious anomalies in section generation or stylistic discrepancies large enough to be distracting
+3. Making the report read as though it were written by one author who compiled these topics together for good purpose
+
+Do NOT:
+1. Impart your own biases, interests, or preferences onto the report
+2. Re-interpret the research information or soften its conclusions
+3. Make useless or unnecessary revisions beyond the scope of ensuring flow from start to finish
+4. Remove or edit ANY in-text citations or instances of applied strikethrough. These are for specific human review and MUST NOT be changed or decoupled
+
+For each suggested edit, provide exact text to find, and exact replacement text.
+Don't include any justification or reasoning for your replacements - they will be inserted directly, so please make sure they fit in context.
+
+Format your response as a JSON object with the following structure:
+{
+  "global_edits": [
+    {
+      "find_text": "exact text to be replaced",
+      "replace_text": "exact replacement text"
+    }
+  ]
+}
+
+The find_text must be the EXACT text string as it appears in the document, and the replace_text must be the EXACT text to replace it with."""
+    ,
+    "introduction_system": """You are a post-grad research assistant writing an introduction for a research report in response to this query: "{query}".
+Create a concise introduction (2-3 paragraphs) that summarizes the purpose of the research and sets the stage for the report content.
+
+The introduction should:
+1. Set the stage for the subject matter and orient the reader toward what's to come.
+2. Introduce the research objective and original intent without simply restating the original query.
+3. Describe key details or aspects of the subject matter to be explored in the report.
+
+The introduction must NOT:
+1. Interpret the content in a lofty way that exaggerates its importance or profundity, or contrives a narrative with empty sophistication.
+2. Attempt to portray the subject matter in any particular sort of light, good or bad, especially by using apologetic or dismissive language.
+3. Focus on perceived complexities or challenges related to the topic or research process, or include appeals to future research.
+
+The introduction should establish the context of the original query, state the research question, and briefly outline the approach taken to answering it.
+Do not add your own bias or sentiment to the introduction. Do not include general statements about the research process itself.
+Please only respond with your introduction - do not include any segue, commentary, explanation, etc.""",
+    "conclusion_system": """You are a post-grad research assistant writing a comprehensive conclusion for a research report in response to this query: "{query}".
+Create a concise conclusion (2-4 paragraphs) that synthesizes the key findings and insights from the research.
+
+The conclusion should:
+1. Restate the research objective and original intent from what has become a more knowing and researched standpoint.
+2. Highlight the most important research discoveries and their significance to the original topic and user query.
+3. Focus on the big picture characterizing the research and topic as a whole, using researched factual content as support.
+4. Definitively address the subject matter, focusing on what we know about it rather than what we don't.
+5. Acknowledge significant tangents in research, but ultimately remain focused on the original topic and user query.
+
+The conclusion must NOT:
+1. Interpret the content in a lofty way that exaggerates its importance or profundity, or contrives a narrative with empty sophistication.
+2. Attempt to portray the subject matter in any particular sort of light, good or bad, especially by using apologetic or dismissive language.
+3. Focus on perceived complexities or challenges related to the topic or research process, or include appeals to future research.
+4. Ever take a preachy or moralizing tone, or take a "stance" for or against/"side" with or against anything not driven by the provided data.
+5. Overstate the significance of specific services, providers, locations, brands, or other entities beyond examples of some type or category.
+6. Sound to the reader as though it is overtly attempting to be diplomatic, considerate, enthusiastic, or overly-generalized.
+
+Please only respond with your conclusion - do not include any segue, commentary, explanation, etc."""
+}
+
+
+def default_memory_stats() -> Dict[str, Any]:
+    return {
+        "results_tokens": 0,
+        "section_tokens": {},
+        "synthesis_tokens": 0,
+        "total_tokens": 0,
+    }
+
+
+def default_conversation_state() -> Dict[str, Any]:
+    return {
+        "research_completed": False,
+        "prev_comprehensive_summary": "",
+        "waiting_for_outline_feedback": False,
+        "outline_feedback_data": None,
+        "research_state": {},
+        "follow_up_mode": False,
+        "user_preferences": {
+            "pdv": None,
+            "strength": 0.0,
+            "impact": 0.0,
+            "labels": "",
+        },
+        "research_dimensions": None,
+        "research_trajectory": None,
+        "pdv_alignment_history": [],
+        "gap_coverage_history": [],
+        "semantic_transformations": None,
+        "section_synthesized_content": {},
+        "section_citations": {},
+        "url_selected_count": {},
+        "url_considered_count": {},
+        "url_token_counts": {},
+        "master_source_table": {},
+        "global_citation_map": {},
+        "verified_citations": [],
+        "flagged_citations": [],
+        "citation_fixes": [],
+        "memory_stats": default_memory_stats(),
+        "results_history": [],
+        "search_history": [],
+        "active_outline": [],
+        "cycle_summaries": [],
+        "completed_topics": set(),
+        "irrelevant_topics": set(),
+    }
+
+
+def truncate_for_log(text: Any, limit: int = 400) -> str:
+    """Safe truncation for logging."""
+    try:
+        s = str(text)
+    except Exception:
+        return "<unprintable>"
+    return s if len(s) <= limit else s[:limit] + "...[truncated]"
 
 
 class EmbeddingCache:
@@ -149,47 +366,7 @@ class ResearchStateManager:
     def get_state(self, conversation_id):
         """Get state for a specific conversation, creating if needed"""
         if conversation_id not in self.conversation_states:
-            self.conversation_states[conversation_id] = {
-                "research_completed": False,
-                "prev_comprehensive_summary": "",
-                "waiting_for_outline_feedback": False,
-                "outline_feedback_data": None,
-                "research_state": None,
-                "follow_up_mode": False,
-                "user_preferences": {
-                    "pdv": None,
-                    "strength": 0.0,
-                    "impact": 0.0,
-                    "labels": "",
-                },
-                "research_dimensions": None,
-                "research_trajectory": None,
-                "pdv_alignment_history": [],
-                "gap_coverage_history": [],
-                "semantic_transformations": None,
-                "section_synthesized_content": {},
-                "section_citations": {},
-                "url_selected_count": {},
-                "url_considered_count": {},
-                "url_token_counts": {},
-                "master_source_table": {},
-                "global_citation_map": {},
-                "verified_citations": [],
-                "flagged_citations": [],
-                "citation_fixes": [],
-                "memory_stats": {
-                    "results_tokens": 0,
-                    "section_tokens": {},
-                    "synthesis_tokens": 0,
-                    "total_tokens": 0,
-                },
-                "results_history": [],
-                "search_history": [],
-                "active_outline": [],
-                "cycle_summaries": [],
-                "completed_topics": set(),
-                "irrelevant_topics": set(),
-            }
+            self.conversation_states[conversation_id] = default_conversation_state()
         return self.conversation_states[conversation_id]
 
     def update_state(self, conversation_id, key, value):
@@ -202,6 +379,310 @@ class ResearchStateManager:
         if conversation_id in self.conversation_states:
             del self.conversation_states[conversation_id]
 
+
+# === Search and content clients ====================================================
+
+class SearchClient:
+    """Handles web search responsibilities for the Pipe.
+
+    This class is kept deliberately thin and delegates attribute
+    lookups back to the parent Pipe instance so existing logic
+    can be moved here with minimal changes.
+    """
+
+    def __init__(self, pipe):
+        self._pipe = pipe
+
+    def __getattr__(self, name):
+        # Delegate attribute access to the parent Pipe
+        return getattr(self._pipe, name)
+
+    async def _try_openwebui_search(self, query: str) -> List[Dict]:
+        """Try to use Open WebUI's built-in search functionality."""
+        try:
+            from open_webui.routers.retrieval import process_web_search, SearchForm
+
+            # OpenWebUI>=0.3 expects a `queries` field (list); older versions allowed `query`.
+            # Provide the new field to satisfy validation and stay backward-friendly.
+            search_form = SearchForm(queries=[query])
+            logger.debug(f"Executing built-in search with query: {query}")
+
+            search_task = asyncio.create_task(
+                process_web_search(self.__request__, search_form, user=self.__user__)
+            )
+            search_results = await asyncio.wait_for(search_task, timeout=15.0)
+
+            logger.debug(f"Search results received: {type(search_results)}")
+            results: List[Dict] = []
+
+            state = self.get_state()
+            url_selected_count = state.get("url_selected_count", {})
+
+            repeat_count = 0
+            for url, count in url_selected_count.items():
+                if count >= self.valves.REPEATS_BEFORE_EXPANSION:
+                    repeat_count += 1
+
+            base_results = self.valves.SEARCH_RESULTS_PER_QUERY
+            additional_results = min(repeat_count, self.valves.EXTRA_RESULTS_PER_QUERY)
+            total_results = (
+                base_results + self.valves.EXTRA_RESULTS_PER_QUERY + additional_results
+            )
+
+            if search_results:
+                if "docs" in search_results:
+                    docs = search_results.get("docs", [])
+                    urls = search_results.get("filenames", [])
+
+                    logger.debug(f"Found {len(docs)} documents in search results")
+
+                    for i, doc in enumerate(docs[:total_results]):
+                        url = urls[i] if i < len(urls) else ""
+                        results.append(
+                            {
+                                "title": f"'{query}'",
+                                "url": url,
+                                "snippet": doc,
+                            }
+                        )
+                elif "collection_name" in search_results:
+                    collection_name = search_results.get("collection_name")
+                    urls = search_results.get("filenames", [])
+
+                    logger.debug(
+                        f"Found collection {collection_name} with {len(urls)} documents"
+                    )
+
+                    for i, url in enumerate(urls[:total_results]):
+                        results.append(
+                            {
+                                "title": f"Search Result {i+1} from {collection_name}",
+                                "url": url,
+                                "snippet": f"Result from collection: {collection_name}",
+                            }
+                        )
+
+            return results
+
+        except asyncio.TimeoutError:
+            logger.error(f"OpenWebUI search timed out for query: {query}")
+            return []
+        except Exception as e:
+            logger.error(f"Error in _try_openwebui_search: {str(e)}")
+            return []
+
+    async def _fallback_search(self, query: str) -> List[Dict]:
+        """Fallback search using direct HTTP request to the configured search API."""
+        try:
+            from urllib.parse import quote
+
+            encoded_query = quote(query)
+            search_url = f"{self.valves.SEARCH_URL}{encoded_query}"
+
+            logger.debug(f"Using fallback search with URL: {search_url}")
+
+            state = self.get_state()
+            url_selected_count = state.get("url_selected_count", {})
+
+            repeat_count = 0
+            for url, count in url_selected_count.items():
+                if count >= self.valves.REPEATS_BEFORE_EXPANSION:
+                    repeat_count += 1
+
+            base_results = self.valves.SEARCH_RESULTS_PER_QUERY
+            additional_results = min(repeat_count, self.valves.EXTRA_RESULTS_PER_QUERY)
+            total_results = (
+                base_results + self.valves.EXTRA_RESULTS_PER_QUERY + additional_results
+            )
+
+            connector = aiohttp.TCPConnector(force_close=True)
+            async with aiohttp.ClientSession(connector=connector) as session:
+                try:
+                    async with session.get(search_url, timeout=15.0) as response:
+                        if response.status != 200:
+                            logger.error(
+                                f"Fallback search returned status code {response.status}"
+                            )
+                            return []
+
+                        content_type = response.headers.get("Content-Type", "").lower()
+                        text = await response.text()
+
+                        # JSON API style
+                        if "application/json" in content_type:
+                            try:
+                                data = json.loads(text)
+                                results: List[Dict] = []
+                                items = (
+                                    data.get("results")
+                                    or data.get("items")
+                                    or data.get("data")
+                                    or []
+                                )
+                                for i, item in enumerate(items[:total_results]):
+                                    title = (
+                                        item.get("title")
+                                        or item.get("name")
+                                        or f"Result {i+1}"
+                                    )
+                                    url = item.get("url") or item.get("link") or ""
+                                    snippet = (
+                                        item.get("snippet")
+                                        or item.get("content")
+                                        or item.get("description")
+                                        or ""
+                                    )
+                                    results.append(
+                                        {
+                                            "title": title,
+                                            "url": url,
+                                            "snippet": snippet,
+                                        }
+                                    )
+                                return results
+                            except Exception as e:
+                                logger.error(f"Error parsing JSON search results: {e}")
+
+                        # HTML page style (e.g. SearXNG)
+                        try:
+                            from bs4 import BeautifulSoup
+                        except ImportError:
+                            BeautifulSoup = None
+
+                        if BeautifulSoup is not None and "<html" in text.lower():
+                            try:
+                                soup = BeautifulSoup(text, "html.parser")
+                                results: List[Dict] = []
+                                result_elements = soup.select("article.result")
+
+                                for i, element in enumerate(
+                                    result_elements[:total_results]
+                                ):
+                                    try:
+                                        title_element = element.select_one("h3 a")
+                                        url_element = element.select_one("h3 a")
+                                        snippet_element = element.select_one(
+                                            "p.content"
+                                        )
+
+                                        title = (
+                                            title_element.get_text()
+                                            if title_element
+                                            else f"Result {i+1}"
+                                        )
+                                        url = (
+                                            url_element.get("href")
+                                            if url_element
+                                            else ""
+                                        )
+                                        snippet = (
+                                            snippet_element.get_text()
+                                            if snippet_element
+                                            else ""
+                                        )
+
+                                        results.append(
+                                            {
+                                                "title": title,
+                                                "url": url,
+                                                "snippet": snippet,
+                                            }
+                                        )
+                                    except Exception as e:
+                                        logger.warning(
+                                            f"Error parsing search result {i}: {e}"
+                                        )
+
+                                if results:
+                                    return results
+                                else:
+                                    logger.warning("No results found in HTML parsing")
+                            except Exception as e:
+                                logger.error(f"Error in HTML parsing: {e}")
+
+                        logger.error(
+                            f"Fallback search returned status code {response.status} but couldn't parse content"
+                        )
+                        return []
+                except asyncio.TimeoutError:
+                    logger.error(f"Fallback search timed out for query: {query}")
+                    return []
+
+        except Exception as e:
+            logger.error(f"Error in fallback search: {e}")
+            return []
+
+    async def search_web(self, query: str) -> List[Dict]:
+        """Perform web search using OpenWebUI first, then fallback."""
+        logger.debug(f"Starting web search for query: {query}")
+
+        state = self.get_state()
+        url_selected_count = state.get("url_selected_count", {})
+
+        # Adjust result count based on repeats
+        repeat_count = sum(1 for c in url_selected_count.values() if c >= self.valves.REPEATS_BEFORE_EXPANSION)
+        base_results = self.valves.SEARCH_RESULTS_PER_QUERY
+        additional_results = min(repeat_count, self.valves.EXTRA_RESULTS_PER_QUERY)
+        total_results = base_results + self.valves.EXTRA_RESULTS_PER_QUERY + additional_results
+
+        logger.debug(
+            f"Requesting {total_results} search results (added {additional_results} due to repeats)"
+        )
+
+        results = await self._try_openwebui_search(query)
+        if not results:
+            logger.debug(
+                f"OpenWebUI search returned no results, trying fallback search for: {query}"
+            )
+            results = await self._fallback_search(query)
+
+        if results:
+            logger.debug(
+                f"Search successful, found {len(results)} results for: {query}"
+            )
+            return results
+
+        logger.warning(f"No search results found for query: {query}")
+        return [
+            {
+                "title": f"No results for '{query}'",
+                "url": "",
+                "snippet": f"No search results were found for the query: {query}",
+            }
+        ]
+
+class ContentProcessor:
+    """Handles content fetching and extraction for the Pipe.
+
+    Like SearchClient, this delegates most attribute access back
+    to the parent Pipe instance to keep behaviour unchanged.
+    """
+
+    def __init__(self, pipe):
+        self._pipe = pipe
+
+    def __getattr__(self, name):
+        # Delegate attribute access to the parent Pipe
+        return getattr(self._pipe, name)
+
+    async def fetch_content(self, url: str) -> str:
+        """Fetch content from a URL with anti-blocking measures and caching."""
+        return await self._pipe._fetch_content_impl(url)
+
+    async def extract_text_from_html(self, html_content: str) -> str:
+        """Extract meaningful text content from HTML."""
+        return await self._pipe.extract_text_from_html(html_content)
+
+    async def extract_text_from_pdf(self, pdf_content) -> str:
+        """Extract text from PDF content."""
+        return await self._pipe._extract_text_from_pdf_impl(pdf_content)
+
+    async def fetch_from_archive(self, url: str, session=None) -> str:
+        """Fetch content from the Internet Archive."""
+        return await self._pipe._fetch_from_archive_impl(url, session=session)
+
+
+# === Pipe core and orchestration ===================================================
 
 class Pipe:
     _active_conversations: Set[str] = set()
@@ -455,6 +936,10 @@ class Pipe:
             default=False,
             description="Enable detailed logging of LLM requests/responses (truncated for safety)",
         )
+        DEBUG_TIMING: bool = Field(
+            default=False,
+            description="Enable timing logs for key sections",
+        )
 
     def __init__(self):
         self.type = "manifold"
@@ -462,6 +947,9 @@ class Pipe:
 
         # Use state manager to isolate conversation states
         self.state_manager = ResearchStateManager()
+        # Helper components for clearer separation of concerns
+        self.search_client = SearchClient(self)
+        self.content_processor = ContentProcessor(self)
         self.conversation_id = None  # Will be set during pipe method
 
         # Shared resources (not conversation-specific)
@@ -506,15 +994,7 @@ class Pipe:
         )
 
         # Initialize memory statistics with proper structure
-        memory_stats = state.get("memory_stats", {})
-        if not memory_stats or not isinstance(memory_stats, dict):
-            memory_stats = {
-                "results_tokens": 0,
-                "section_tokens": {},
-                "synthesis_tokens": 0,
-                "total_tokens": 0,
-            }
-        self.update_state("memory_stats", memory_stats)
+        memory_stats = self._ensure_memory_stats()
 
         # Update results_tokens if we have initial results
         if initial_results:
@@ -571,15 +1051,7 @@ class Pipe:
     async def update_token_counts(self, new_results=None):
         """Centralized function to update token counts consistently"""
         state = self.get_state()
-        memory_stats = state.get(
-            "memory_stats",
-            {
-                "results_tokens": 0,
-                "section_tokens": {},
-                "synthesis_tokens": 0,
-                "total_tokens": 0,
-            },
-        )
+        memory_stats = self._ensure_memory_stats()
 
         # Update results tokens if new results provided
         if new_results:
@@ -632,7 +1104,8 @@ class Pipe:
         if self.conversation_id:
             return self.conversation_id
         # Generate a temporary ID if we don't have one yet
-        temp_id = f"temp_{hash(str(self.__user__.id))}"
+        user_id = getattr(getattr(self, "__user__", None), "id", "anonymous")
+        temp_id = f"temp_{hash(str(user_id))}"
         self._set_conversation_context(temp_id)
         return temp_id
 
@@ -654,6 +1127,52 @@ class Pipe:
             self.trajectory_accumulator = None
             self.is_pdf_content = False
             logger.info(f"Full state reset for conversation: {conv_id}")
+
+    @contextmanager
+    def timed(self, label: str):
+        """Context manager to log elapsed time when DEBUG_TIMING is enabled."""
+        start = time.perf_counter()
+        try:
+            yield
+        finally:
+            if getattr(self.valves, "DEBUG_TIMING", False):
+                elapsed = time.perf_counter() - start
+                logger.info("TIMING %s: %.3fs", label, elapsed)
+
+    def debug_log(self, message: str, *args):
+        """Log debug info only when DEBUG_LLM is enabled."""
+        if getattr(self.valves, "DEBUG_LLM", False):
+            logger.debug(message, *args)
+
+    def _ensure_memory_stats(self) -> Dict[str, Any]:
+        """Guarantee memory_stats exists and is shaped correctly."""
+        state = self.get_state()
+        memory_stats = state.get("memory_stats")
+        if not isinstance(memory_stats, dict):
+            memory_stats = default_memory_stats()
+            self.update_state("memory_stats", memory_stats)
+            return memory_stats
+
+        # Fill missing keys without clobbering existing numbers
+        defaults = default_memory_stats()
+        for key, default_value in defaults.items():
+            if key not in memory_stats:
+                memory_stats[key] = default_value if not isinstance(default_value, dict) else default_value.copy()
+        self.update_state("memory_stats", memory_stats)
+        return memory_stats
+
+    def _ensure_tracking_maps(self):
+        """Ensure common tracking dictionaries exist to avoid scattered init code."""
+        required_maps = [
+            "master_source_table",
+            "url_selected_count",
+            "url_considered_count",
+            "url_token_counts",
+        ]
+        for key in required_maps:
+            state = self.get_state()
+            if key not in state or state.get(key) is None:
+                self.update_state(key, {})
 
     def _max_conversations(self) -> int:
         """Number of allowed concurrent sessions"""
@@ -1018,7 +1537,10 @@ class Pipe:
             # Keep components that explain 80% of variance
             cumulative_variance = np.cumsum(explained_variance_ratio)
             n_components = np.argmax(cumulative_variance >= 0.8) + 1
-            n_components = max(3, min(n_components, 10))  # At least 3, at most 10
+
+            # Cap to available dimensionality (no artificial minimum that can desync shapes)
+            available_dims = min(len(eigenvalues), embeddings_array.shape[1])
+            n_components = max(1, min(n_components, available_dims, 10))
 
             # Project embeddings onto principal components
             principal_components = eigenvectors[:, :n_components]
@@ -1181,6 +1703,11 @@ class Pipe:
             if isinstance(transformation, str):
                 # In a real implementation, retrieve from cache/storage
                 logger.warning(f"Transformation ID not found: {transformation}")
+                return embedding
+
+            # Guard against unexpected transformation payloads
+            if not isinstance(transformation, dict) or "matrix" not in transformation:
+                logger.warning("Invalid transformation payload; skipping transformation")
                 return embedding
 
             # If it's a transformation object, get the matrix
@@ -1357,14 +1884,8 @@ class Pipe:
                 # - "Item 1."
                 # - "Item 1)"
                 # - "Item 1:"
-                number_patterns = [
-                    r"^\d+[\.\)\:]",
-                    r"^[A-Za-z][\.\)\:]",
-                    r".*\d+[\.\)\:]$",
-                ]
-
                 # Check if line matches any numbered pattern
-                for pattern in number_patterns:
+                for pattern in NUMBERED_LINE_PATTERNS:
                     if re.search(pattern, current_line):
                         is_numbered_item = True
                         break
@@ -1565,15 +2086,21 @@ class Pipe:
         max_tokens: Optional[int] = None,
     ) -> str:
         """Apply semantic compression with local similarity influence and token limiting"""
+        start_time = time.perf_counter() if getattr(self.valves, "DEBUG_TIMING", False) else None
+        def _finish(val: str) -> str:
+            if start_time is not None:
+                elapsed = time.perf_counter() - start_time
+                logger.info("TIMING compress_local %.3fs", elapsed)
+            return val
         # Skip compression for very short content
         if len(content) < 100:
-            return content
+            return _finish(content)
 
         # Apply token limit if specified
         if max_tokens:
             content_tokens = await self.count_tokens(content)
             if content_tokens <= max_tokens:
-                return content
+                return _finish(content)
 
             # If over limit, use token-based compression ratio
             if not ratio:
@@ -1584,7 +2111,7 @@ class Pipe:
 
         # Skip compression if only one chunk
         if len(chunks) <= 1:
-            return content
+            return _finish(content)
 
         # Get embeddings for chunks sequentially
         chunk_embeddings = []
@@ -1595,24 +2122,12 @@ class Pipe:
 
         # Skip compression if not enough embeddings
         if len(chunk_embeddings) <= 1:
-            return content
+            return _finish(content)
 
         # Define compression ratio if not provided
         if ratio is None:
-            compress_ratios = {
-                1: 0.9,  # 90% - minimal compression
-                2: 0.8,  # 80%
-                3: 0.7,  # 70%
-                4: 0.6,  # 60%
-                5: 0.5,  # 50% - moderate compression
-                6: 0.4,  # 40%
-                7: 0.3,  # 30%
-                8: 0.2,  # 20%
-                9: 0.15,  # 15%
-                10: 0.1,  # 10% - maximum compression
-            }
             level = self.valves.COMPRESSION_LEVEL
-            ratio = compress_ratios.get(level, 0.5)
+            ratio = COMPRESSION_RATIO_MAP.get(level, 0.5)
 
         # Calculate how many chunks to keep
         n_chunks = len(chunk_embeddings)
@@ -1773,7 +2288,7 @@ class Pipe:
                         )
                     )
 
-            return compressed_content
+            return _finish(compressed_content)
 
         except Exception as e:
             logger.error(f"Error during compression with local similarity: {e}")
@@ -1785,9 +2300,31 @@ class Pipe:
                 if content_tokens > max_tokens:
                     char_ratio = max_tokens / content_tokens
                     char_limit = int(len(content) * char_ratio)
-                    return content[:char_limit]
+                    return _finish(content[:char_limit])
 
-            return content
+            return _finish(content)
+
+    def _normalize_projected_chunks(
+        self, projected_chunks: Any, n_components: int
+    ) -> List[List[float]]:
+        """Ensure projected chunks are 2D and have at least n_components columns."""
+        if not isinstance(projected_chunks, list):
+            return []
+
+        normalized: List[List[float]] = []
+        for pc in projected_chunks:
+            if isinstance(pc, (int, float)):
+                row = [float(pc)]
+            elif isinstance(pc, (list, tuple, np.ndarray)):
+                row = [float(x) for x in pc]
+            else:
+                # Unknown shape; skip
+                continue
+
+            if len(row) < n_components:
+                row = row + [0.0] * (n_components - len(row))
+            normalized.append(row)
+        return normalized
 
     async def compress_content_with_eigendecomposition(
         self,
@@ -1798,15 +2335,21 @@ class Pipe:
         max_tokens: Optional[int] = None,
     ) -> str:
         """Apply semantic compression using eigendecomposition with token limiting"""
+        start_time = time.perf_counter() if getattr(self.valves, "DEBUG_TIMING", False) else None
+        def _finish(val: str) -> str:
+            if start_time is not None:
+                elapsed = time.perf_counter() - start_time
+                logger.info("TIMING compress_eigen %.3fs", elapsed)
+            return val
         # Skip compression for very short content
         if len(content) < 200:
-            return content
+            return _finish(content)
 
         # Apply token limit if specified
         if max_tokens:
             content_tokens = await self.count_tokens(content)
             if content_tokens <= max_tokens:
-                return content
+                return _finish(content)
 
             # If over limit, use token-based compression ratio
             if not ratio:
@@ -1817,7 +2360,7 @@ class Pipe:
 
         # Skip compression if only one chunk
         if len(chunks) <= 2:
-            return content
+            return _finish(content)
 
         # Get embeddings for chunks sequentially
         chunk_embeddings = []
@@ -1828,24 +2371,12 @@ class Pipe:
 
         # Skip compression if not enough embeddings
         if len(chunk_embeddings) <= 2:
-            return content
+            return _finish(content)
 
         # Define compression ratio if not provided
         if ratio is None:
-            compress_ratios = {
-                1: 0.9,  # 90% - minimal compression
-                2: 0.8,  # 80%
-                3: 0.7,  # 70%
-                4: 0.6,  # 60%
-                5: 0.5,  # 50% - moderate compression
-                6: 0.4,  # 40%
-                7: 0.3,  # 30%
-                8: 0.2,  # 20%
-                9: 0.15,  # 15%
-                10: 0.1,  # 10% - maximum compression
-            }
             level = self.valves.COMPRESSION_LEVEL
-            ratio = compress_ratios.get(level, 0.5)
+            ratio = COMPRESSION_RATIO_MAP.get(level, 0.5)
 
         # Calculate how many chunks to keep
         n_chunks = len(chunks)
@@ -1855,11 +2386,57 @@ class Pipe:
         if n_keep >= n_chunks:
             n_keep = max(1, n_chunks - 1)
 
+        # Debug instrumentation to help trace eigendecomposition issues
+        if logger.isEnabledFor(logging.DEBUG):
+            try:
+                nan_inf = any(
+                    np.isnan(np.array(emb)).any() or np.isinf(np.array(emb)).any()
+                    for emb in chunk_embeddings
+                )
+            except Exception:
+                nan_inf = True
+            logger.debug(
+                "Eigencompression debug: chunks=%d chunk_embeddings=%d n_keep=%d ratio=%.3f nan_or_inf=%s",
+                len(chunks),
+                len(chunk_embeddings),
+                n_keep,
+                ratio,
+                nan_inf,
+            )
+
         try:
+            # Pull cached semantic transformations once (used for query transforms)
+            semantic_transformations = self.get_state().get("semantic_transformations")
+
             # Perform semantic eigendecomposition
             eigendecomposition = await self.compute_semantic_eigendecomposition(
                 chunks, chunk_embeddings
             )
+
+            # Validate eigendecomposition structure before proceeding
+            required_keys = {
+                "projected_embeddings",
+                "eigenvectors",
+                "explained_variance",
+                "n_components",
+            }
+            if not isinstance(eigendecomposition, dict) or not required_keys.issubset(
+                eigendecomposition.keys()
+            ):
+                logger.debug(
+                    "Eigendecomposition missing keys: present=%s required=%s raw=%s",
+                    list(eigendecomposition.keys()) if isinstance(eigendecomposition, dict) else type(eigendecomposition),
+                    list(required_keys),
+                    eigendecomposition,
+                )
+                logger.warning(
+                    "Eigendecomposition invalid or incomplete; using local similarity compression"
+                )
+                return _finish(
+                    await self.compress_content_with_local_similarity(
+                        content, query_embedding, summary_embedding, ratio, max_tokens
+                    )
+                )
 
             if eigendecomposition:
                 # Calculate importance scores based on the eigendecomposition
@@ -1891,8 +2468,57 @@ class Pipe:
                 )
 
                 # Project chunks into the principal component space for better analysis
-                projected_chunks = eigendecomposition["projected_embeddings"]
+                raw_projected_chunks = eigendecomposition["projected_embeddings"]
+
+                if not isinstance(raw_projected_chunks, list) or not raw_projected_chunks:
+                    logger.debug(
+                        "Projected embeddings malformed: type=%s sample=%s",
+                        type(raw_projected_chunks),
+                        raw_projected_chunks[:3] if isinstance(raw_projected_chunks, list) else raw_projected_chunks,
+                    )
+                    logger.warning(
+                        "Projected embeddings malformed; using local similarity compression"
+                    )
+                    return _finish(
+                        await self.compress_content_with_local_similarity(
+                            content,
+                            query_embedding,
+                            summary_embedding,
+                            ratio,
+                            max_tokens,
+                        )
+                    )
+
+                # Validate column count; if mismatched, fall back rather than padding
+                first_pc = raw_projected_chunks[0]
+                if isinstance(first_pc, (int, float)):
+                    col_count = 1
+                elif isinstance(first_pc, (list, tuple, np.ndarray)):
+                    col_count = len(first_pc)
+                else:
+                    col_count = 0
+
+                expected_components = eigendecomposition["n_components"]
+                if col_count < expected_components:
+                    logger.warning(
+                        "Projected embeddings have fewer columns (%s) than expected components (%s); using local similarity compression",
+                        col_count,
+                        expected_components,
+                    )
+                    return _finish(
+                        await self.compress_content_with_local_similarity(
+                            content,
+                            query_embedding,
+                            summary_embedding,
+                            ratio,
+                            max_tokens,
+                        )
+                    )
+
                 eigenvectors = np.array(eigendecomposition["eigenvectors"])
+                projected_chunks = self._normalize_projected_chunks(
+                    raw_projected_chunks, expected_components
+                )
 
                 # Calculate local coherence using the eigenspace
                 local_coherence = []
@@ -1931,15 +2557,17 @@ class Pipe:
                 # Calculate relevance to query using transformed embeddings
                 if query_embedding:
                     try:
+                        transformed_query = query_embedding
+
                         # Ensure we're getting transformed embeddings if a transformation is available
                         if semantic_transformations:
-                            transformed_query = (
+                            transformed_candidate = (
                                 await self.apply_semantic_transformation(
                                     query_embedding, semantic_transformations
                                 )
                             )
-                            if transformed_query:
-                                query_embedding = transformed_query
+                            if transformed_candidate:
+                                transformed_query = transformed_candidate
 
                         # Calculate similarities with transformed query in one operation
                         query_relevance = []
@@ -2053,22 +2681,34 @@ class Pipe:
                             )
                         )
 
-                return compressed_content
+                return _finish(compressed_content)
 
             # Fallback if eigendecomposition fails
             logger.warning(
                 "Eigendecomposition compression failed, using original method"
             )
-            return await self.compress_content_with_local_similarity(
-                content, query_embedding, summary_embedding, ratio, max_tokens
+            return _finish(
+                await self.compress_content_with_local_similarity(
+                    content, query_embedding, summary_embedding, ratio, max_tokens
+                )
             )
 
         except Exception as e:
-            logger.error(f"Error during compression with eigendecomposition: {e}")
+            # Add contextual debug info to help pinpoint the root cause
+            logger.error(
+                "Error during compression with eigendecomposition: %s | chunks=%d embeddings=%d n_keep=%d ratio=%s",
+                e,
+                len(chunks),
+                len(chunk_embeddings),
+                n_keep,
+                ratio,
+            )
             # Fall back to original compression method
             try:
-                return await self.compress_content_with_local_similarity(
-                    content, query_embedding, summary_embedding, ratio, max_tokens
+                return _finish(
+                    await self.compress_content_with_local_similarity(
+                        content, query_embedding, summary_embedding, ratio, max_tokens
+                    )
                 )
             except Exception as fallback_error:
                 logger.error(f"Fallback compression also failed: {fallback_error}")
@@ -2080,9 +2720,9 @@ class Pipe:
                     if content_tokens > max_tokens:
                         char_ratio = max_tokens / content_tokens
                         char_limit = int(len(content) * char_ratio)
-                        return content[:char_limit]
+                        return _finish(content[:char_limit])
 
-                return content  # Return original content if both methods fail
+                return _finish(content)  # Return original content if both methods fail
 
     async def handle_repeated_content(
         self, content: str, url: str, query_embedding: List[float], repeat_count: int
@@ -2250,19 +2890,7 @@ class Pipe:
             compression_level = self.valves.COMPRESSION_LEVEL
 
             # Map compression level to ratio
-            compress_ratios = {
-                1: 0.9,  # 90% - minimal compression
-                2: 0.8,  # 80%
-                3: 0.7,  # 70%
-                4: 0.6,  # 60%
-                5: 0.5,  # 50% - moderate compression
-                6: 0.4,  # 40%
-                7: 0.3,  # 30%
-                8: 0.2,  # 20%
-                9: 0.15,  # 15%
-                10: 0.1,  # 10% - maximum compression
-            }
-            ratio = compress_ratios.get(compression_level, 0.5)
+            ratio = COMPRESSION_RATIO_MAP.get(compression_level, 0.5)
 
             try:
                 # Compress using eigendecomposition with token limit
@@ -2315,19 +2943,7 @@ class Pipe:
             compression_level = min(10, self.valves.COMPRESSION_LEVEL + 1)
 
             # Map compression level to ratio
-            compress_ratios = {
-                1: 0.9,  # 90% - minimal compression
-                2: 0.8,  # 80%
-                3: 0.7,  # 70%
-                4: 0.6,  # 60%
-                5: 0.5,  # 50% - moderate compression
-                6: 0.4,  # 40%
-                7: 0.3,  # 30%
-                8: 0.2,  # 20%
-                9: 0.15,  # 15%
-                10: 0.1,  # 10% - maximum compression
-            }
-            ratio = compress_ratios.get(compression_level, 0.5)
+            ratio = COMPRESSION_RATIO_MAP.get(compression_level, 0.5)
 
             try:
                 # Compress using eigendecomposition with token limit
@@ -3359,6 +3975,82 @@ class Pipe:
         except Exception as e:
             logger.error(f"Error updating dimension coverage: {e}")
 
+    async def _rate_limit_domain(self, domain_session_map, domain: str):
+        """Apply simple delay to avoid hitting the same domain too fast."""
+        if domain not in domain_session_map:
+            return
+        domain_info = domain_session_map[domain]
+        last_access_time = domain_info.get("last_visit", 0)
+        current_time = time.time()
+        time_since_last_access = current_time - last_access_time
+
+        if time_since_last_access < 3.0:
+            base_delay = 2.0
+            jitter = random.uniform(0.1, 1.0)
+            delay_time = max(0, base_delay - time_since_last_access + jitter)
+            if delay_time > 0.1:
+                logger.info(
+                    f"Rate limiting for domain {domain}: Delaying for {delay_time:.2f} seconds"
+                )
+                await asyncio.sleep(delay_time)
+
+    def _build_request_headers(self, domain_session_map, domain: str) -> Dict[str, str]:
+        """Create realistic headers with rotating user agents."""
+        try:
+            from fake_useragent import UserAgent
+
+            ua = UserAgent()
+            random_user_agent = ua.random
+        except ImportError:
+            user_agents = [
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:123.0) Gecko/20100101 Firefox/123.0",
+                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Edge/123.0.0.0 Safari/537.36",
+            ]
+            random_user_agent = random.choice(user_agents)
+
+        headers = {
+            "User-Agent": random_user_agent,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.5",
+            "Accept-Encoding": "gzip, deflate, br",
+            "DNT": "1",
+            "Connection": "keep-alive",
+            "Upgrade-Insecure-Requests": "1",
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": "cross-site",
+            "Sec-Fetch-User": "?1",
+            "Cache-Control": "max-age=0",
+            "sec-ch-ua": '"Chromium";v="116", "Google Chrome";v="116", "Not=A?Brand";v="99"',
+            "sec-ch-ua-mobile": "?0",
+            "sec-ch-ua-platform": '"Windows"',
+        }
+
+        university_ips = {
+            "Harvard": "128.103.192." + str(random.randint(1, 254)),
+            "Princeton": "128.112.203." + str(random.randint(1, 254)),
+            "MIT": "18.7."
+            + str(random.randint(1, 254))
+            + "."
+            + str(random.randint(1, 254)),
+            "Stanford": "171.64."
+            + str(random.randint(1, 254))
+            + "."
+            + str(random.randint(1, 254)),
+        }
+
+        chosen_university = random.choice(list(university_ips.keys()))
+        headers["X-Forwarded-For"] = university_ips[chosen_university]
+        headers["X-Requested-With"] = "XMLHttpRequest"
+        headers["X-Academic-Institution"] = chosen_university
+
+        if domain not in domain_session_map:
+            domain_session_map[domain] = {"cookies": {}, "last_visit": 0}
+        return headers
+
     async def identify_research_gaps(self) -> List[str]:
         """Identify semantic dimensions that need more research"""
         state = self.get_state()
@@ -3381,11 +4073,43 @@ class Pipe:
             logger.error(f"Error identifying research gaps: {e}")
             return []
 
-    async def extract_text_from_html(self, html_content: str) -> str:
+    async def extract_text_from_html(self, html_content: str, prefer_bs4: bool = True) -> str:
         """Extract meaningful text content from HTML with proper character handling"""
         try:
             # Try BeautifulSoup if available
+            def _regex_extract(raw_html: str) -> str:
+                import re
+                import html
+
+                unescaped_content = html.unescape(raw_html) if isinstance(raw_html, str) else raw_html
+                content = re.sub(
+                    r"<script[^>]*>.*?</script>",
+                    " ",
+                    unescaped_content,
+                    flags=re.DOTALL,
+                )
+                content = re.sub(
+                    r"<style[^>]*>.*?</style>", " ", content, flags=re.DOTALL
+                )
+                content = re.sub(
+                    r"<head[^>]*>.*?</head>", " ", content, flags=re.DOTALL
+                )
+                content = re.sub(r"<nav[^>]*>.*?</nav>", " ", content, flags=re.DOTALL)
+                content = re.sub(
+                    r"<header[^>]*>.*?</header>", " ", content, flags=re.DOTALL
+                )
+                content = re.sub(
+                    r"<footer[^>]*>.*?</footer>", " ", content, flags=re.DOTALL
+                )
+                content = re.sub(r"<[^>]*>", " ", content)
+                content = re.sub(r"\.([A-Z])", ". \\1", content)
+                content = re.sub(r"\s+", " ", content).strip()
+                return content
+
             try:
+                if not prefer_bs4:
+                    return _regex_extract(html_content)
+
                 from bs4 import BeautifulSoup
                 import html
                 import re  # Explicitly import re here for the closure
@@ -3415,37 +4139,10 @@ class Pipe:
                         element.decompose()
 
                     # Remove common menu and navigation classes - expanded list
-                    nav_patterns = [
-                        "menu",
-                        "nav",
-                        "header",
-                        "footer",
-                        "sidebar",
-                        "dropdown",
-                        "ibar",
-                        "navigation",
-                        "navbar",
-                        "topbar",
-                        "tab",
-                        "toolbar",
-                        "section",
-                        "submenu",
-                        "subnav",
-                        "panel",
-                        "drawer",
-                        "accordion",
-                        "toc",
-                        "login",
-                        "signin",
-                        "auth",
-                        "user-login",
-                        "authType",
-                    ]
-
                     # Case-insensitive class matching with partial matches
                     for element in soup.find_all(
                         class_=lambda c: c
-                        and any(x.lower() in c.lower() for x in nav_patterns)
+                        and any(x.lower() in c.lower() for x in NAVIGATION_CLASS_PATTERNS)
                     ):
                         element.decompose()
 
@@ -3500,121 +4197,26 @@ class Pipe:
                     return bs4_result
 
                 # Otherwise fall back to the regex version
-                # Quick regex extraction first
-                import re
-                import html
-
-                # First unescape HTML entities properly
-                unescaped_content = html.unescape(html_content)
-
-                # Remove script and style tags
-                content = re.sub(
-                    r"<script[^>]*>.*?</script>",
-                    " ",
-                    unescaped_content,
-                    flags=re.DOTALL,
-                )
-                content = re.sub(
-                    r"<style[^>]*>.*?</style>", " ", content, flags=re.DOTALL
-                )
-                content = re.sub(
-                    r"<head[^>]*>.*?</head>", " ", content, flags=re.DOTALL
-                )
-                content = re.sub(r"<nav[^>]*>.*?</nav>", " ", content, flags=re.DOTALL)
-                content = re.sub(
-                    r"<header[^>]*>.*?</header>", " ", content, flags=re.DOTALL
-                )
-                content = re.sub(
-                    r"<footer[^>]*>.*?</footer>", " ", content, flags=re.DOTALL
-                )
-
-                # Remove HTML tags
-                content = re.sub(r"<[^>]*>", " ", content)
-
-                # Fix common issues with periods and spaces
-                content = re.sub(
-                    r"\.([A-Z])", ". \\1", content
-                )  # Fix "years.Today's" -> "years. Today's"
-
-                # Cleanup whitespace
-                content = re.sub(r"\s+", " ", content).strip()
-
-                return content
+                return _regex_extract(html_content)
 
             except (ImportError, asyncio.TimeoutError, Exception) as e:
                 logger.warning(
                     f"BeautifulSoup extraction failed: {e}, using regex fallback"
                 )
                 # Use regex version if BS4 fails
-                import re
-                import html
-
-                # First unescape HTML entities properly
-                unescaped_content = (
-                    html.unescape(html_content)
-                    if isinstance(html_content, str)
-                    else html_content
-                )
-
-                # Remove script and style tags
-                content = re.sub(
-                    r"<script[^>]*>.*?</script>",
-                    " ",
-                    unescaped_content,
-                    flags=re.DOTALL,
-                )
-                content = re.sub(
-                    r"<style[^>]*>.*?</style>", " ", content, flags=re.DOTALL
-                )
-                content = re.sub(
-                    r"<head[^>]*>.*?</head>", " ", content, flags=re.DOTALL
-                )
-                content = re.sub(r"<nav[^>]*>.*?</nav>", " ", content, flags=re.DOTALL)
-                content = re.sub(
-                    r"<header[^>]*>.*?</header>", " ", content, flags=re.DOTALL
-                )
-                content = re.sub(
-                    r"<footer[^>]*>.*?</footer>", " ", content, flags=re.DOTALL
-                )
-
-                # Remove HTML tags
-                content = re.sub(r"<[^>]*>", " ", content)
-
-                # Fix common issues with periods and spaces
-                content = re.sub(
-                    r"\.([A-Z])", ". \\1", content
-                )  # Fix "years.Today's" -> "years. Today's"
-
-                # Cleanup whitespace
-                content = re.sub(r"\s+", " ", content).strip()
-
-                return content
+                return _regex_extract(html_content)
 
         except Exception as e:
             logger.error(f"Error extracting text from HTML: {e}")
             # Simple fallback - remove all HTML tags and unescape HTML entities
             try:
-                import re
-                import html
-
-                # Unescape HTML entities
-                if isinstance(html_content, str):
-                    unescaped = html.unescape(html_content)
-                else:
-                    unescaped = html_content
-
-                # Remove HTML tags
-                text = re.sub(r"<[^>]*>", " ", unescaped)
-
-                # Normalize whitespace
-                text = re.sub(r"\s+", " ", text).strip()
-
-                return text
+                return _regex_extract(html_content)
             except:
                 return html_content
 
-    async def fetch_content(self, url: str) -> str:
+    async def _fetch_content_impl(self, url: str) -> str:
         """Fetch content from a URL with anti-blocking measures and domain-specific rate limiting"""
+        start_time = time.perf_counter() if getattr(self.valves, "DEBUG_TIMING", False) else None
         try:
             state = self.get_state()
             url_considered_count = state.get("url_considered_count", {})
@@ -3640,26 +4242,7 @@ class Pipe:
             domain = parsed_url.netloc
 
             # Domain-specific rate limiting
-            # Check if we've recently accessed this domain
-            if domain in domain_session_map:
-                domain_info = domain_session_map[domain]
-                last_access_time = domain_info.get("last_visit", 0)
-                current_time = time.time()
-                time_since_last_access = current_time - last_access_time
-
-                # If we accessed this domain recently, delay to avoid rate limiting
-                # Only delay if less than 2-3 seconds have passed since last access
-                if time_since_last_access < 3.0:
-                    # Add randomness to the delay (between 2-3 seconds total between requests)
-                    base_delay = 2.0
-                    jitter = random.uniform(0.1, 1.0)
-                    delay_time = max(0, base_delay - time_since_last_access + jitter)
-
-                    if delay_time > 0.1:  # Only log/delay if significant
-                        logger.info(
-                            f"Rate limiting for domain {domain}: Delaying for {delay_time:.2f} seconds"
-                        )
-                        await asyncio.sleep(delay_time)
+            await self._rate_limit_domain(domain_session_map, domain)
 
             # Import fake-useragent for better user agent rotation
             try:
@@ -3679,43 +4262,8 @@ class Pipe:
                 random_user_agent = random.choice(user_agents)
 
             # Create comprehensive browser fingerprint headers
-            headers = {
-                "User-Agent": random_user_agent,
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                "Accept-Language": "en-US,en;q=0.5",
-                "Accept-Encoding": "gzip, deflate, br",
-                "DNT": "1",
-                "Connection": "keep-alive",
-                "Upgrade-Insecure-Requests": "1",
-                "Sec-Fetch-Dest": "document",
-                "Sec-Fetch-Mode": "navigate",
-                "Sec-Fetch-Site": "cross-site",
-                "Sec-Fetch-User": "?1",
-                "Cache-Control": "max-age=0",
-                "sec-ch-ua": '"Chromium";v="116", "Google Chrome";v="116", "Not=A?Brand";v="99"',
-                "sec-ch-ua-mobile": "?0",
-                "sec-ch-ua-platform": '"Windows"',
-            }
-
-            # Add EZproxy-like headers
-            university_ips = {
-                "Harvard": "128.103.192." + str(random.randint(1, 254)),
-                "Princeton": "128.112.203." + str(random.randint(1, 254)),
-                "MIT": "18.7."
-                + str(random.randint(1, 254))
-                + "."
-                + str(random.randint(1, 254)),
-                "Stanford": "171.64."
-                + str(random.randint(1, 254))
-                + "."
-                + str(random.randint(1, 254)),
-            }
-
-            chosen_university = random.choice(list(university_ips.keys()))
-            headers["X-Forwarded-For"] = university_ips[chosen_university]
-            headers["X-Requested-With"] = "XMLHttpRequest"
-
-            # Add institutional cookies
+            headers = self._build_request_headers(domain_session_map, domain)
+            chosen_university = headers.get("X-Academic-Institution", "Harvard")
             if domain not in domain_session_map:
                 domain_session_map[domain] = {
                     "cookies": {},
@@ -3826,7 +4374,7 @@ class Pipe:
                             # Get PDF content as bytes
                             pdf_content = await response.read()
                             self.is_pdf_content = True  # Set the PDF flag
-                            extracted_content = await self.extract_text_from_pdf(
+                            extracted_content = await self.content_processor.extract_text_from_pdf(
                                 pdf_content
                             )
 
@@ -3880,7 +4428,7 @@ class Pipe:
                             logger.info(
                                 f"Received 403 for PDF {url}, trying archive.org"
                             )
-                            archive_content = await self.fetch_from_archive(
+                            archive_content = await self.content_processor.fetch_from_archive(
                                 url, session
                             )
                             if archive_content:
@@ -3922,7 +4470,7 @@ class Pipe:
                                 # This is a PDF even though the URL didn't end with .pdf
                                 pdf_content = await response.read()
                                 self.is_pdf_content = True  # Set the PDF flag
-                                extracted_content = await self.extract_text_from_pdf(
+                                extracted_content = await self.content_processor.extract_text_from_pdf(
                                     pdf_content
                                 )
 
@@ -3981,7 +4529,7 @@ class Pipe:
                                 self.valves.EXTRACT_CONTENT_ONLY
                                 and content.strip().startswith("<")
                             ):
-                                extracted = await self.extract_text_from_html(content)
+                                extracted = await self.content_processor.extract_text_from_html(content)
 
                                 # Limit cached content to 3x MAX_RESULT_TOKENS
                                 if extracted:
@@ -4093,7 +4641,7 @@ class Pipe:
                             logger.info(
                                 f"Received 403 for URL {url}, trying archive.org"
                             )
-                            archive_content = await self.fetch_from_archive(
+                            archive_content = await self.content_processor.fetch_from_archive(
                                 url, session
                             )
                             if archive_content:
@@ -4126,8 +4674,12 @@ class Pipe:
         except Exception as e:
             logger.error(f"Error fetching content from {url}: {e}")
             return f"Error fetching content: {str(e)}"
+        finally:
+            if start_time is not None:
+                elapsed = time.perf_counter() - start_time
+                logger.info("TIMING fetch:%s %.3fs", url, elapsed)
 
-    async def fetch_from_archive(self, url: str, session=None) -> str:
+    async def _fetch_from_archive_impl(self, url: str, session=None) -> str:
         """Fetch content from the Internet Archive (archive.org)"""
         try:
             # Construct Wayback Machine URL
@@ -4166,7 +4718,7 @@ class Pipe:
                                         pdf_content = await archive_response.read()
                                         self.is_pdf_content = True
                                         extracted_content = (
-                                            await self.extract_text_from_pdf(
+                                            await self.content_processor.extract_text_from_pdf(
                                                 pdf_content
                                             )
                                         )
@@ -4218,7 +4770,7 @@ class Pipe:
                                             and content.strip().startswith("<")
                                         ):
                                             extracted = (
-                                                await self.extract_text_from_html(
+                                                await self.content_processor.extract_text_from_html(
                                                     content
                                                 )
                                             )
@@ -4293,7 +4845,7 @@ class Pipe:
             logger.error(f"Error fetching from archive.org: {e}")
             return ""
 
-    async def extract_text_from_pdf(self, pdf_content) -> str:
+    async def _extract_text_from_pdf_impl(self, pdf_content) -> str:
         """Extract text from PDF content using PyPDF2 or pdfplumber"""
         if not self.valves.HANDLE_PDFS:
             return "PDF processing is disabled in settings."
@@ -4587,7 +5139,7 @@ class Pipe:
                 await self.emit_status(
                     "info", f"Fetching content from URL: {url}...", False
                 )
-                content = await self.fetch_content(url)
+                content = await self.content_processor.fetch_content(url)
 
                 if content and len(content) > 200:
                     snippet = content
@@ -4807,7 +5359,8 @@ class Pipe:
             from open_webui.routers.retrieval import process_web_search, SearchForm
 
             # Create a search form with the query
-            search_form = SearchForm(query=query)
+            # Newer OpenWebUI versions require `queries` list; use it to avoid validation errors.
+            search_form = SearchForm(queries=[query])
 
             # Call the search function
             logger.debug(f"Executing built-in search with query: {query}")
@@ -5024,57 +5577,8 @@ class Pipe:
             return []
 
     async def search_web(self, query: str) -> List[Dict]:
-        """Perform web search with fallbacks"""
-        logger.debug(f"Starting web search for query: {query}")
-
-        # Get state for URL tracking
-        state = self.get_state()
-        url_selected_count = state.get("url_selected_count", {})
-
-        # Calculate additional results to fetch based on repeat counts
-        # Count URLs that have been shown multiple times
-        repeat_count = 0
-        for url, count in url_selected_count.items():
-            if count >= self.valves.REPEATS_BEFORE_EXPANSION:
-                repeat_count += 1
-
-        # Calculate total results to fetch
-        base_results = self.valves.SEARCH_RESULTS_PER_QUERY
-        additional_results = min(repeat_count, self.valves.EXTRA_RESULTS_PER_QUERY)
-        total_results = (
-            base_results + self.valves.EXTRA_RESULTS_PER_QUERY + additional_results
-        )
-
-        logger.debug(
-            f"Requesting {total_results} search results (added {additional_results} due to repeats)"
-        )
-
-        # First try OpenWebUI search
-        results = await self._try_openwebui_search(query)
-
-        # If that failed, try fallback search
-        if not results:
-            logger.debug(
-                f"OpenWebUI search returned no results, trying fallback search for: {query}"
-            )
-            results = await self._fallback_search(query)
-
-        # If we got results, return them
-        if results:
-            logger.debug(
-                f"Search successful, found {len(results)} results for: {query}"
-            )
-            return results
-
-        # No results - create a minimal result to continue
-        logger.warning(f"No search results found for query: {query}")
-        return [
-            {
-                "title": f"No results for '{query}'",
-                "url": "",
-                "snippet": f"No search results were found for the query: {query}",
-            }
-        ]
+        """Perform web search via the SearchClient helper."""
+        return await self.search_client.search_web(query)
 
     async def select_most_relevant_results(
         self,
@@ -5177,7 +5681,7 @@ class Pipe:
                             False,
                         )
                         # Only fetch the first part of the content for evaluation
-                        content_preview = await self.fetch_content(url)
+                        content_preview = await self.content_processor.fetch_content(url)
                         if content_preview:
                             snippet = content_preview[
                                 : self.valves.RELEVANCY_SNIPPET_LENGTH
@@ -5826,20 +6330,12 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
 
             debug_llm = getattr(self.valves, "DEBUG_LLM", False)
             if debug_llm:
-                # Truncate content to avoid noisy logs
-                def _shorten(text: Any, limit: int = 400) -> str:
-                    try:
-                        s = str(text)
-                    except Exception:
-                        return "<unprintable>"
-                    return s if len(s) <= limit else s[:limit] + "...[truncated]"
-
                 preview_messages = []
                 for msg in messages:
                     preview_messages.append(
                         {
                             "role": msg.get("role"),
-                            "content": _shorten(msg.get("content", "")),
+                            "content": truncate_for_log(msg.get("content", "")),
                         }
                     )
                 logger.info(
@@ -5858,11 +6354,12 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
                 "keep_alive": "10m",
             }
 
-            response = await generate_chat_completions(
-                self.__request__,
-                form_data,
-                user=self.__user__,
-            )
+            with self.timed(f"completion:{model}"):
+                response = await generate_chat_completions(
+                    self.__request__,
+                    form_data,
+                    user=self.__user__,
+                )
 
             normalized = await self._normalize_completion_response(response)
 
@@ -5877,7 +6374,7 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
                     logger.info(
                         "LLM DEBUG response model=%s content=%s",
                         model,
-                        _shorten(content),
+                        truncate_for_log(content),
                     )
                 except Exception as e:
                     logger.info(f"LLM DEBUG response logging failed: {e}")
@@ -7952,7 +8449,8 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
         # Add the research outline for context
         subtopic_context += "## Research Outline Context:\n"
         state = self.get_state()
-        synthesis_outline = state.get("research_state", {}).get("research_outline", [])
+        research_state = state.get("research_state") or {}
+        synthesis_outline = research_state.get("research_outline", [])
         if synthesis_outline:
             for topic_item in synthesis_outline:
                 topic = topic_item.get("topic", "")
@@ -8314,7 +8812,7 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
 
                     # If not in cache, fetch source content
                     if not source_content or len(source_content) < 200:
-                        source_content = await self.fetch_content(url)
+                        source_content = await self.content_processor.fetch_content(url)
 
                     if source_content and len(source_content) >= 200:
                         # Add global ID to each citation for verification tracking
@@ -8470,7 +8968,7 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
             section_content = combined_content
 
         # Track token counts
-        memory_stats = state.get("memory_stats", {})
+        memory_stats = self._ensure_memory_stats()
         section_tokens = memory_stats.get("section_tokens", {})
         section_tokens[section_title] = total_tokens
         memory_stats["section_tokens"] = section_tokens
@@ -8551,7 +9049,8 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
 
         # Add the research outline for better context
         state = self.get_state()
-        research_outline = state.get("research_state", {}).get("research_outline", [])
+        research_state = state.get("research_state") or {}
+        research_outline = research_state.get("research_outline", [])
         if research_outline:
             smoothing_context += f"## Full Research Outline:\n"
             for topic_item in research_outline:
@@ -8980,7 +9479,7 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
                         # If not in cache, fetch source content
                         if not source_content or len(source_content) < 200:
                             logger.info(f"Fetching content for verification: {url}")
-                            source_content = await self.fetch_content(url)
+                            source_content = await self.content_processor.fetch_content(url)
 
                         if not source_content or len(source_content) < 200:
                             # If we couldn't fetch content, mark all citations as unverified
@@ -9106,12 +9605,12 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
         file_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
         # Prepare the export data structure
+        research_state = state.get("research_state") or {}
+
         export_data = {
             "export_timestamp": export_timestamp,
             "research_date": self.research_date,
-            "original_query": state.get("research_state", {}).get(
-                "user_message", "Unknown query"
-            ),
+            "original_query": research_state.get("user_message", "Unknown query"),
             "results_count": len(results_history),
             "results": [],
         }
@@ -9145,7 +9644,7 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
             export_data["results"].append(export_result)
 
         # Generate filename based on the research query (sanitized) and timestamp
-        query_text = state.get("research_state", {}).get("user_message", "research")
+        query_text = research_state.get("user_message", "research")
         # Sanitize the query for a filename (first 30 chars, remove unsafe chars)
         query_for_filename = (
             "".join(c if c.isalnum() or c in " -_" else "_" for c in query_text[:30])
@@ -9303,34 +9802,7 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
         """Review the compiled synthesis and suggest edits"""
         review_prompt = {
             "role": "system",
-            "content": """You are a post-grad research editor reviewing a comprehensive research report assembled per-section in different model contexts.
-	Your task is to identify any issues with this combination of multiple sections and the flow between them.
-	
-	Focus on:
-	1. Identifying areas needing better transitions between sections
-    2. Finding obvious anomalies in section generation or stylistic discrepancies large enough to be distracting
-	3. Making the report read as though it were written by one author who compiled these topics together for good purpose
-	
-	Do NOT:
-	1. Impart your own biases, interests, or preferences onto the report
-	2. Re-interpret the research information or soften its conclusions
-	3. Make useless or unnecessary revisions beyond the scope of ensuring flow from start to finish
-    4. Remove or edit ANY in-text citations or instances of applied strikethrough. These are for specific human review and MUST NOT be changed or decoupled
-    
-    For each suggested edit, provide exact text to find, and exact replacement text.
-    Don't include any justification or reasoning for your replacements - they will be inserted directly, so please make sure they fit in context.
-    
-    Format your response as a JSON object with the following structure:
-    {
-      "global_edits": [
-        {
-          "find_text": "exact text to be replaced", 
-          "replace_text": "exact replacement text"
-        }
-      ]
-    }
-    
-    The find_text must be the EXACT text string as it appears in the document, and the replace_text must be the EXACT text to replace it with.""",
+            "content": PROMPTS["section_review_system"],
         }
 
         # Create context with all sections
@@ -9345,7 +9817,7 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
         # Add the full content of each section
         review_context += "## Complete Report Content by Section:\n\n"
         state = self.get_state()
-        memory_stats = state.get("memory_stats", {})
+        memory_stats = self._ensure_memory_stats()
         section_tokens = memory_stats.get("section_tokens", {})
 
         for section_title, content in compiled_sections.items():
@@ -9734,29 +10206,7 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
         """Generate a main title and subtitle for the research report"""
         titles_prompt = {
             "role": "system",
-            "content": """You are a post-grad research writer creating compelling titles for research reports.
-			
-	Create a main title and subtitle for a comprehensive research report. The titles should:
-	1. Be relevant and accurately reflect the content and focus of the research
-	2. Be engaging and professional. Intriguing, even
-	3. Follow academic/research paper conventions
-	4. Avoid clickbait or sensationalism unless it's really begging for it
-	
-	For main title:
-	- 5-12 words in length
-	- Clear and focused
-	- Appropriately formal for academic/research context
-	
-	For subtitle:
-	- 8-15 words in length
-	- Provides additional context and specificity
-	- Complements the main title without redundancy
-	
-	Format your response as a JSON object with the following structure:
-	{
-	  "main_title": "Your proposed main title",
-	  "subtitle": "Your proposed subtitle"
-	}""",
+            "content": PROMPTS["titles_system"],
         }
 
         # Create a context with the research query and a summary of the comprehensive answer
@@ -9823,24 +10273,7 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
         """Generate an abstract for the research report"""
         abstract_prompt = {
             "role": "system",
-            "content": f"""You are a post-grad research assistant writing an abstract for a comprehensive research report.
-			
-	Create a concise academic abstract (150-250 words) that summarizes the research report. The abstract should:
-	1. Outline the research objective and original intent without simply restating the original query
-	2. Summarize the key findings and their significance
-	3. Be written in an academic yet interesting tone
-	4. Be self-contained and understandable on its own
-    5. Draw you in by highlighting the interesting aspects of the research without being misleading or disingenuous
-
-    The abstract must NOT:
-    1. Interpret the content in a lofty way that exaggerates its importance or profundity, or contrives a narrative with empty sophistication. 
-    2. Attempt to portray the subject matter in any particular sort of light, good or bad, especially by using apologetic or dismissive language.
-    3. Focus on perceived complexities or challenges related to the topic or research process, or include appeals to future research.
-    4. Ever take a preachy or moralizing tone, or take a "stance" for or against/"side" with or against anything not driven by the provided data.
-    5. Overstate the significance of specific services, providers, locations, brands, or other entities beyond examples of some type or category.
-    6. Sound to the reader as though it is overtly attempting to be diplomatic, considerate, enthusiastic, or overly-generalized.
-
-	The abstract should follow scientific paper abstract structure but be accessible to an educated general audience.""",
+            "content": PROMPTS["abstract_system"],
         }
 
         # Create a context with the full report and bibliography information
@@ -9939,26 +10372,8 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
 
             # Initialize master source table if not exists
             state = self.get_state()
-            if "master_source_table" not in state:
-                self.update_state("master_source_table", {})
-
-            # Initialize other critical state variables if missing
-            if "memory_stats" not in state:
-                self.update_state(
-                    "memory_stats",
-                    {
-                        "results_tokens": 0,
-                        "section_tokens": {},
-                        "synthesis_tokens": 0,
-                        "total_tokens": 0,
-                    },
-                )
-
-            if "url_selected_count" not in state:
-                self.update_state("url_selected_count", {})
-
-            if "url_token_counts" not in state:
-                self.update_state("url_token_counts", {})
+            self._ensure_tracking_maps()
+            self._ensure_memory_stats()
 
             # If the pipe is disabled or it's not a default task, return
             if not self.valves.ENABLED or (__task__ and __task__ != TASKS.DEFAULT):
@@ -11477,27 +11892,12 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
     
             # Add abstract
             comprehensive_answer += f"## Abstract\n\n{abstract}\n\n"
-    
+
             # Add introduction with compression
             await self.emit_synthesis_status("Generating introduction...")
             intro_prompt = {
                 "role": "system",
-                "content": f"""You are a post-grad research assistant writing an introduction for a research report in response to this query: "{user_message}".
-                    Create a concise introduction (2-3 paragraphs) that summarizes the purpose of the research and sets the stage for the report content.
-    
-                	The introduction should:
-                    1. Set the stage for the subject matter and orient the reader toward what's to come.
-                	2. Introduce the research objective and original intent without simply restating the original query.
-                	3. Describe key details or aspects of the subject matter to be explored in the report.
-                
-                    The introduction must NOT:
-                    1. Interpret the content in a lofty way that exaggerates its importance or profundity, or contrives a narrative with empty sophistication. 
-                    2. Attempt to portray the subject matter in any particular sort of light, good or bad, especially by using apologetic or dismissive language.
-                    3. Focus on perceived complexities or challenges related to the topic or research process, or include appeals to future research.
-                    
-                    The introduction should establish the context of the original query, state the research question, and briefly outline the approach taken to answering it. 
-                    Do not add your own bias or sentiment to the introduction. Do not include general statements about the research process itself.
-                    Please only respond with your introduction - do not include any segue, commentary, explanation, etc.""",
+                "content": PROMPTS["introduction_system"].format(query=user_message),
             }
     
             intro_context = f"Research Query: {user_message}\n\nResearch Outline:"
@@ -11546,7 +11946,7 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
             # Add each section with heading
             for section_title, content in edited_sections.items():
                 # Get token count for the section
-                memory_stats = state.get("memory_stats", {})
+                memory_stats = self._ensure_memory_stats()
                 section_tokens = memory_stats.get("section_tokens", {})
                 section_tokens_count = section_tokens.get(section_title, 0)
                 if section_tokens_count == 0:
@@ -11572,25 +11972,7 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
             await self.emit_synthesis_status("Generating conclusion...")
             concl_prompt = {
                 "role": "system",
-                "content": f"""You are a post-grad research assistant writing a comprehensive conclusion for a research report in response to this query: "{user_message}".
-                    Create a concise conclusion (2-4 paragraphs) that synthesizes the key findings and insights from the research.
-                    
-                    The conclusion should:
-                	1. Restate the research objective and original intent from what has become a more knowing and researched standpoint.
-                	2. Highlight the most important research discoveries and their significance to the original topic and user query.
-                    3. Focus on the big picture characterizing the research and topic as a whole, using researched factual content as support.
-                    4. Definitively address the subject matter, focusing on what we know about it rather than what we don't.
-                    5. Acknowledge significant tangents in research, but ultimately remain focused on the original topic and user query.
-                
-                    The conclusion must NOT:
-                    1. Interpret the content in a lofty way that exaggerates its importance or profundity, or contrives a narrative with empty sophistication. 
-                    2. Attempt to portray the subject matter in any particular sort of light, good or bad, especially by using apologetic or dismissive language.
-                    3. Focus on perceived complexities or challenges related to the topic or research process, or include appeals to future research.
-                    4. Ever take a preachy or moralizing tone, or take a "stance" for or against/"side" with or against anything not driven by the provided data.
-                    5. Overstate the significance of specific services, providers, locations, brands, or other entities beyond examples of some type or category.
-                    6. Sound to the reader as though it is overtly attempting to be diplomatic, considerate, enthusiastic, or overly-generalized.
-        
-                    Please only respond with your conclusion - do not include any segue, commentary, explanation, etc.""",
+                "content": PROMPTS["conclusion_system"].format(query=user_message),
             }
     
             concl_context = (
@@ -11657,7 +12039,7 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
     
             # Count total tokens in the comprehensive answer
             synthesis_tokens = await self.count_tokens(comprehensive_answer)
-            memory_stats = state.get("memory_stats", {})
+            memory_stats = self._ensure_memory_stats()
             memory_stats["synthesis_tokens"] = synthesis_tokens
             self.update_state("memory_stats", memory_stats)
     
@@ -11732,6 +12114,14 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
                 cleanup_done = True
             if not cleanup_done:
                 await self._release_conversation_slot(conversation_id)
+
+    async def _try_openwebui_search(self, query: str) -> List[Dict]:
+        """Delegate to SearchClient for OpenWebUI search."""
+        return await self.search_client._try_openwebui_search(query)
+
+    async def _fallback_search(self, query: str) -> List[Dict]:
+        """Delegate to SearchClient for fallback search."""
+        return await self.search_client._fallback_search(query)
 
 
 class TrajectoryAccumulator:
