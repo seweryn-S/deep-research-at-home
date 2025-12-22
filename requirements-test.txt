@@ -1,0 +1,9 @@
+aiohttp
+beautifulsoup4
+fake-useragent
+numpy
+pdfplumber
+PyPDF2
+pydantic
+pytest
+scikit-learn

@@ -397,8 +397,41 @@ class SearchClient:
         # Delegate attribute access to the parent Pipe
         return getattr(self._pipe, name)
 
+    def _debug_search_enabled(self) -> bool:
+        return bool(getattr(self.valves, "DEBUG_SEARCH", False))
+
+    def _log_search_debug(self, message: str, **fields) -> None:
+        if not self._debug_search_enabled():
+            return
+        filtered_fields = {k: v for k, v in fields.items() if v is not None}
+        if filtered_fields:
+            parts = " ".join(f"{k}={filtered_fields[k]!r}" for k in sorted(filtered_fields))
+            logger.info("SEARCH DEBUG: %s %s", message, parts)
+        else:
+            logger.info("SEARCH DEBUG: %s", message)
+
+    def _truncate_text(self, text: Optional[str], limit: int = 500) -> Optional[str]:
+        if text is None:
+            return None
+        normalized = " ".join(text.split())
+        if len(normalized) > limit:
+            return normalized[:limit] + "..."
+        return normalized
+
+    def _summarize_results(self, results: List[Dict], limit: int = 3) -> List[Dict]:
+        summary = []
+        for result in results[:limit]:
+            summary.append(
+                {
+                    "title": result.get("title", ""),
+                    "url": result.get("url", ""),
+                }
+            )
+        return summary
+
     async def _try_openwebui_search(self, query: str) -> List[Dict]:
         """Try to use Open WebUI's built-in search functionality."""
+        self._log_search_debug("openwebui_search_start", query=query)
         try:
             from open_webui.routers.retrieval import process_web_search, SearchForm
 
@@ -413,6 +446,13 @@ class SearchClient:
             search_results = await asyncio.wait_for(search_task, timeout=15.0)
 
             logger.debug(f"Search results received: {type(search_results)}")
+            self._log_search_debug(
+                "openwebui_search_raw",
+                result_type=type(search_results).__name__,
+                result_keys=list(search_results.keys())
+                if isinstance(search_results, dict)
+                else None,
+            )
             results: List[Dict] = []
 
             state = self.get_state()
@@ -435,6 +475,12 @@ class SearchClient:
                     urls = search_results.get("filenames", [])
 
                     logger.debug(f"Found {len(docs)} documents in search results")
+                    self._log_search_debug(
+                        "openwebui_search_docs",
+                        docs_count=len(docs),
+                        urls_count=len(urls),
+                        total_results=total_results,
+                    )
 
                     for i, doc in enumerate(docs[:total_results]):
                         url = urls[i] if i < len(urls) else ""
@@ -452,6 +498,12 @@ class SearchClient:
                     logger.debug(
                         f"Found collection {collection_name} with {len(urls)} documents"
                     )
+                    self._log_search_debug(
+                        "openwebui_search_collection",
+                        collection=collection_name,
+                        urls_count=len(urls),
+                        total_results=total_results,
+                    )
 
                     for i, url in enumerate(urls[:total_results]):
                         results.append(
@@ -461,14 +513,23 @@ class SearchClient:
                                 "snippet": f"Result from collection: {collection_name}",
                             }
                         )
+            else:
+                self._log_search_debug("openwebui_search_empty", query=query)
 
+            self._log_search_debug(
+                "openwebui_search_parsed",
+                results_count=len(results),
+                sample_results=self._summarize_results(results),
+            )
             return results
 
         except asyncio.TimeoutError:
             logger.error(f"OpenWebUI search timed out for query: {query}")
+            self._log_search_debug("openwebui_search_timeout", query=query)
             return []
         except Exception as e:
             logger.error(f"Error in _try_openwebui_search: {str(e)}")
+            self._log_search_debug("openwebui_search_error", query=query, error=repr(e))
             return []
 
     async def _fallback_search(self, query: str) -> List[Dict]:
@@ -480,6 +541,9 @@ class SearchClient:
             search_url = f"{self.valves.SEARCH_URL}{encoded_query}"
 
             logger.debug(f"Using fallback search with URL: {search_url}")
+            self._log_search_debug(
+                "fallback_search_start", query=query, search_url=search_url
+            )
 
             state = self.get_state()
             url_selected_count = state.get("url_selected_count", {})
@@ -499,14 +563,25 @@ class SearchClient:
             async with aiohttp.ClientSession(connector=connector) as session:
                 try:
                     async with session.get(search_url, timeout=15.0) as response:
+                        content_type = response.headers.get("Content-Type", "").lower()
+                        text = await response.text()
+                        self._log_search_debug(
+                            "fallback_search_response",
+                            status=response.status,
+                            content_type=content_type,
+                            text_len=len(text),
+                            text_snippet=self._truncate_text(text),
+                        )
                         if response.status != 200:
                             logger.error(
                                 f"Fallback search returned status code {response.status}"
                             )
+                            self._log_search_debug(
+                                "fallback_search_http_error",
+                                status=response.status,
+                                response_snippet=self._truncate_text(text),
+                            )
                             return []
-
-                        content_type = response.headers.get("Content-Type", "").lower()
-                        text = await response.text()
 
                         # JSON API style
                         if "application/json" in content_type:
@@ -539,9 +614,20 @@ class SearchClient:
                                             "snippet": snippet,
                                         }
                                     )
+                                self._log_search_debug(
+                                    "fallback_search_json_parsed",
+                                    items_count=len(items),
+                                    results_count=len(results),
+                                    sample_results=self._summarize_results(results),
+                                )
                                 return results
                             except Exception as e:
                                 logger.error(f"Error parsing JSON search results: {e}")
+                                self._log_search_debug(
+                                    "fallback_search_json_error",
+                                    error=repr(e),
+                                    response_snippet=self._truncate_text(text),
+                                )
 
                         # HTML page style (e.g. SearXNG)
                         try:
@@ -554,6 +640,10 @@ class SearchClient:
                                 soup = BeautifulSoup(text, "html.parser")
                                 results: List[Dict] = []
                                 result_elements = soup.select("article.result")
+                                self._log_search_debug(
+                                    "fallback_search_html_elements",
+                                    elements_count=len(result_elements),
+                                )
 
                                 for i, element in enumerate(
                                     result_elements[:total_results]
@@ -594,27 +684,49 @@ class SearchClient:
                                         )
 
                                 if results:
+                                    self._log_search_debug(
+                                        "fallback_search_html_parsed",
+                                        results_count=len(results),
+                                        sample_results=self._summarize_results(results),
+                                    )
                                     return results
                                 else:
                                     logger.warning("No results found in HTML parsing")
+                                    self._log_search_debug(
+                                        "fallback_search_html_empty",
+                                        response_snippet=self._truncate_text(text),
+                                    )
                             except Exception as e:
                                 logger.error(f"Error in HTML parsing: {e}")
+                                self._log_search_debug(
+                                    "fallback_search_html_error",
+                                    error=repr(e),
+                                    response_snippet=self._truncate_text(text),
+                                )
 
                         logger.error(
                             f"Fallback search returned status code {response.status} but couldn't parse content"
                         )
+                        self._log_search_debug(
+                            "fallback_search_unparsed",
+                            status=response.status,
+                            response_snippet=self._truncate_text(text),
+                        )
                         return []
                 except asyncio.TimeoutError:
                     logger.error(f"Fallback search timed out for query: {query}")
+                    self._log_search_debug("fallback_search_timeout", query=query)
                     return []
 
         except Exception as e:
             logger.error(f"Error in fallback search: {e}")
+            self._log_search_debug("fallback_search_error", query=query, error=repr(e))
             return []
 
     async def search_web(self, query: str) -> List[Dict]:
         """Perform web search using OpenWebUI first, then fallback."""
         logger.debug(f"Starting web search for query: {query}")
+        self._log_search_debug("search_web_start", query=query)
 
         state = self.get_state()
         url_selected_count = state.get("url_selected_count", {})
@@ -630,19 +742,28 @@ class SearchClient:
         )
 
         results = await self._try_openwebui_search(query)
+        self._log_search_debug("search_web_openwebui_results", count=len(results))
         if not results:
             logger.debug(
                 f"OpenWebUI search returned no results, trying fallback search for: {query}"
             )
+            self._log_search_debug("search_web_fallback_start", query=query)
             results = await self._fallback_search(query)
+            self._log_search_debug("search_web_fallback_results", count=len(results))
 
         if results:
             logger.debug(
                 f"Search successful, found {len(results)} results for: {query}"
             )
+            self._log_search_debug(
+                "search_web_done",
+                results_count=len(results),
+                sample_results=self._summarize_results(results),
+            )
             return results
 
         logger.warning(f"No search results found for query: {query}")
+        self._log_search_debug("search_web_no_results", query=query)
         return [
             {
                 "title": f"No results for '{query}'",
@@ -936,6 +1057,10 @@ class Pipe:
             default=False,
             description="Enable detailed logging of LLM requests/responses (truncated for safety)",
         )
+        DEBUG_SEARCH: bool = Field(
+            default=False,
+            description="Enable detailed logging for web search requests and responses",
+        )
         DEBUG_TIMING: bool = Field(
             default=False,
             description="Enable timing logs for key sections",
@@ -1095,6 +1220,66 @@ class Pipe:
         except Exception:
             # ContextVar.set shouldn't fail, but keep a fallback
             pass
+
+    def _resolve_conversation_id(self, body: dict, user_id: str) -> str:
+        """Resolve a stable conversation ID for the current OpenWebUI chat."""
+        candidate_sources = []
+        if isinstance(body, dict):
+            candidate_sources.extend(
+                [
+                    ("body.chat_id", body.get("chat_id")),
+                    ("body.chatId", body.get("chatId")),
+                    ("body.conversation_id", body.get("conversation_id")),
+                    ("body.conversationId", body.get("conversationId")),
+                ]
+            )
+            chat_block = body.get("chat")
+            if isinstance(chat_block, dict):
+                candidate_sources.extend(
+                    [
+                        ("body.chat.id", chat_block.get("id")),
+                        ("body.chat.chat_id", chat_block.get("chat_id")),
+                        ("body.chat.chatId", chat_block.get("chatId")),
+                    ]
+                )
+            messages = body.get("messages", [])
+            if isinstance(messages, list) and messages:
+                first_message = messages[0]
+                if isinstance(first_message, dict):
+                    candidate_sources.extend(
+                        [
+                            ("messages[0].chat_id", first_message.get("chat_id")),
+                            ("messages[0].chatId", first_message.get("chatId")),
+                        ]
+                    )
+
+        for label, candidate in candidate_sources:
+            if isinstance(candidate, str) and candidate.strip():
+                conversation_id = f"{user_id}_{candidate.strip()}"
+                if self.valves.DEBUG_SEARCH:
+                    logger.info(
+                        "CONVERSATION DEBUG: conversation_id=%r source=%s raw=%r",
+                        conversation_id,
+                        label,
+                        candidate,
+                    )
+                return conversation_id
+
+        messages = body.get("messages", []) if isinstance(body, dict) else []
+        first_message = messages[0] if messages else {}
+        message_id = (
+            first_message.get("id", "default") if isinstance(first_message, dict) else "default"
+        )
+        conversation_id = f"{user_id}_{message_id}"
+        if self.valves.DEBUG_SEARCH:
+            source = "messages[0].id" if message_id != "default" else "default"
+            logger.info(
+                "CONVERSATION DEBUG: conversation_id=%r source=%s raw=%r",
+                conversation_id,
+                source,
+                message_id,
+            )
+        return conversation_id
 
     def _get_current_conversation_id(self) -> str:
         """Retrieve the conversation ID bound to this task"""
@@ -4048,7 +4233,11 @@ class Pipe:
         headers["X-Academic-Institution"] = chosen_university
 
         if domain not in domain_session_map:
-            domain_session_map[domain] = {"cookies": {}, "last_visit": 0}
+            domain_session_map[domain] = {
+                "cookies": {},
+                "last_visit": 0,
+                "visit_count": 0,
+            }
         return headers
 
     async def identify_research_gaps(self) -> List[str]:
@@ -4326,6 +4515,10 @@ class Pipe:
                 }
 
             domain_session = domain_session_map[domain]
+            if not isinstance(domain_session, dict):
+                domain_session = {"cookies": {}, "last_visit": 0, "visit_count": 0}
+                domain_session_map[domain] = domain_session
+            domain_session.setdefault("visit_count", 0)
             domain_session["visit_count"] += 1
 
             domain_session["last_visit"] = time.time()
@@ -5113,6 +5306,12 @@ class Pipe:
 
         # Require a URL for all results
         if not url:
+            if self.valves.DEBUG_SEARCH:
+                logger.info(
+                    "SEARCH DEBUG: result_missing_url query=%r title=%r",
+                    query,
+                    title,
+                )
             return {
                 "title": title or f"Result for '{query}'",
                 "url": "",
@@ -5146,11 +5345,29 @@ class Pipe:
                     logger.debug(
                         f"Successfully fetched content from URL: {url} ({len(content)} chars)"
                     )
+                    if self.valves.DEBUG_SEARCH:
+                        logger.info(
+                            "SEARCH DEBUG: fetch_content_ok url=%r length=%d",
+                            url,
+                            len(content),
+                        )
                 else:
                     logger.warning(f"Failed to fetch useful content from URL: {url}")
+                    if self.valves.DEBUG_SEARCH:
+                        logger.info(
+                            "SEARCH DEBUG: fetch_content_failed url=%r length=%d",
+                            url,
+                            len(content) if content else 0,
+                        )
 
             # If we still don't have useful content, mark as invalid
             if not snippet or len(snippet) < 200:
+                if self.valves.DEBUG_SEARCH:
+                    logger.info(
+                        "SEARCH DEBUG: result_content_too_short url=%r length=%d",
+                        url,
+                        len(snippet) if snippet else 0,
+                    )
                 return {
                     "title": title or f"Result for '{query}'",
                     "url": url,
@@ -5978,13 +6195,29 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
         summary_embedding: Optional[List[float]] = None,
     ) -> List[Dict]:
         """Process a single search query and get results with quality filtering"""
+        if self.valves.DEBUG_SEARCH:
+            logger.info("SEARCH DEBUG: process_query_start query=%r", query)
         await self.emit_status("info", f"Searching for: {query}", False)
 
         # Sanitize the query to make it safer for search engines
         sanitized_query = await self.sanitize_query(query)
+        if self.valves.DEBUG_SEARCH:
+            logger.info(
+                "SEARCH DEBUG: process_query_sanitized query=%r sanitized=%r",
+                query,
+                sanitized_query,
+            )
 
         # Get search results for the query
         search_results = await self.search_web(sanitized_query)
+        if self.valves.DEBUG_SEARCH:
+            empty_url_count = sum(1 for r in search_results if not r.get("url"))
+            logger.info(
+                "SEARCH DEBUG: search_results_received query=%r total=%d empty_url=%d",
+                query,
+                len(search_results),
+                empty_url_count,
+            )
         if not search_results:
             await self.emit_message(f"*No results found for query: {query}*\n\n")
             return []
@@ -6256,6 +6489,15 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
 
         # Update token counts with new results
         await self.update_token_counts(successful_results)
+
+        if self.valves.DEBUG_SEARCH:
+            logger.info(
+                "SEARCH DEBUG: process_query_summary query=%r successful=%d failed=%d rejected=%d",
+                query,
+                len(successful_results),
+                failed_count,
+                len(rejected_results),
+            )
 
         return successful_results
 
@@ -10343,9 +10585,9 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
         if not messages:
             return ""
 
-        # First message ID in the conversation serves as our conversation identifier
-        first_message = messages[0] if messages else {}
-        conversation_id = f"{__user__['id']}_{first_message.get('id', 'default')}"
+        # Prefer OpenWebUI chat id if provided; fall back to first message id
+        user_id = __user__.get("id", "anonymous")
+        conversation_id = self._resolve_conversation_id(body, user_id)
         self._set_conversation_context(conversation_id)
 
         # Respect max concurrent conversations

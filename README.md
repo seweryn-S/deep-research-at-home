@@ -10,3 +10,19 @@ Distributed under the Apache-2.0 License. See LICENSE for details.
 - Wektory: `get_embedding` korzysta z endpointu OpenAI `/v1/embeddings`, cache’uje wymiary i usuwa ładowanie prebudowanych słowników; generowanie wymiarów badań (PCA) zapisuje teksty oraz embeddingi tematów do późniejszej interpretacji.
 - Semantyka wymiarów: nazewnictwo PCA przeniesione z dopasowania słownika do wywołań LLM na podstawie reprezentatywnych tematów; dodane bezpieczne fallbacki przy brakach lub niezgodnościach wymiarów.
 - UI i język: wymuszanie języka odpowiedzi dla komunikatów użytkownika (`OUTPUT_LANGUAGE`), lokalizacja outline/analizy na PL lub EN, nowe zwijane `<details>` dla wyników i analiz, komunikaty wyników wyszukiwania pakowane w collapsible blokach.
+
+## Testing
+
+Create a virtual environment and install test dependencies:
+
+```bash
+python -m venv .venv
+. .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements-test.txt
+pytest
+```
+
+Note: In restricted environments you may see a `joblib` warning about falling back to
+serial mode (permission denied when creating semaphores). Tests still pass; if you want
+to silence the warning, run `JOBLIB_MULTIPROCESSING=0 pytest`.
