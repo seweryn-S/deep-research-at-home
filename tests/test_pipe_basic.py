@@ -12,14 +12,6 @@ def test_pipe_has_required_interface():
     pipe.__user__ = types.SimpleNamespace(id="test-user")
     pipe._set_conversation_context("test-conv")
 
-    # Minimal conversation/user context so get_state works
-    pipe.__user__ = types.SimpleNamespace(id="test-user")
-    pipe._set_conversation_context("test-conv")
-
-    # Minimal conversation/user context so get_state works
-    pipe.__user__ = types.SimpleNamespace(id="test-user")
-    pipe._set_conversation_context("test-conv")
-
     # Required attributes for Open WebUI pipes
     assert hasattr(pipe, "valves")
     assert hasattr(pipe, "type")

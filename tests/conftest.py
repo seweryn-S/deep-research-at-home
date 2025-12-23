@@ -41,11 +41,14 @@ sys.modules["open_webui.models.users"] = SimpleNamespace(User=_User)
 
 # routers.retrieval.process_web_search / SearchForm
 class _SearchForm:
-    def __init__(self, query: str):
+    def __init__(self, query: str | None = None, queries=None, **kwargs):
         self.query = query
+        if queries is None and query is not None:
+            queries = [query]
+        self.queries = queries or []
 
 
-def _process_web_search(request, search_form, user=None):
+async def _process_web_search(request, search_form, user=None):
     # Return minimal empty search result structure
     return {"docs": [], "filenames": []}
 

@@ -11,15 +11,25 @@ Distributed under the Apache-2.0 License. See LICENSE for details.
 - Semantyka wymiarów: nazewnictwo PCA przeniesione z dopasowania słownika do wywołań LLM na podstawie reprezentatywnych tematów; dodane bezpieczne fallbacki przy brakach lub niezgodnościach wymiarów.
 - UI i język: wymuszanie języka odpowiedzi dla komunikatów użytkownika (`OUTPUT_LANGUAGE`), lokalizacja outline/analizy na PL lub EN, nowe zwijane `<details>` dla wyników i analiz, komunikaty wyników wyszukiwania pakowane w collapsible blokach.
 
+## Bundling (OpenWebUI)
+
+OpenWebUI wymaga jednego pliku `pipe.py`. Źródła są w `src/`, a plik wynikowy generuje `build_pipe.py`.
+
+- Generowanie: `python3 build_pipe.py`
+- Sprawdzenie spójności (np. w CI): `python3 build_pipe.py --check --diff`
+
+Uwaga: `src/main.py` to tylko cienki wrapper do lokalnego importu; właściwa implementacja Pipe jest w `src/pipe_impl.py`.
+Większość logiki jest rozbita na moduły `src/pipe_*.py` (mixiny), a `src/pipe_impl.py` składa je w jedną klasę `Pipe`.
+
 ## Testing
 
 Create a virtual environment and install test dependencies:
 
 ```bash
-python -m venv .venv
+python3 -m venv .venv
 . .venv/bin/activate
-python -m pip install --upgrade pip
-python -m pip install -r requirements-test.txt
+python3 -m pip install --upgrade pip
+python3 -m pip install -r requirements-test.txt
 pytest
 ```
 
