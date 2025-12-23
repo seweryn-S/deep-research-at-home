@@ -21,6 +21,14 @@ OpenWebUI wymaga jednego pliku `pipe.py`. Źródła są w `src/`, a plik wynikow
 Uwaga: `src/main.py` to tylko cienki wrapper do lokalnego importu; właściwa implementacja Pipe jest w `src/pipe_impl.py`.
 Większość logiki jest rozbita na moduły `src/pipe_*.py` (mixiny), a `src/pipe_impl.py` składa je w jedną klasę `Pipe`.
 
+## Dokumentacja (development)
+
+- `docs/pipe/README.md` – mapa plików i orientacja w projekcie
+- `docs/pipe/ALGORITHM.md` – opis algorytmu end-to-end (diagram + pseudokod)
+- `docs/pipe/STATE.md` – kontrakt stanu per-konwersacja (klucze, lifecycle, gotchas)
+- `docs/pipe/CONFIG.md` – opis `Valves` (konfiguracja) i wpływ na flow
+- `docs/adr/0001-bundling-pipe-py.md` – decyzja architektoniczna dot. bundlingu
+
 ## Testing
 
 Create a virtual environment and install test dependencies:
